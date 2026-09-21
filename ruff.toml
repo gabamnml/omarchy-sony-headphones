@@ -1,0 +1,10 @@
+# Ruff is a development-only lint tool. The helper never imports it and the
+# plugin never needs it to run (ADR-0001, ADR-0002). Only the pycodestyle "E"
+# and pyflakes "F" rule families are on.
+#
+# The repo predates any formatter and sets no column limit; E501 is left off so
+# the gate is about defects rather than reflowing files this change does not own.
+
+[lint]
+select = ["E", "F"]
+ignore = ["E501"]

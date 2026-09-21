@@ -1,0 +1,8 @@
+#!/bin/sh
+# Pre-commit gate for the Sony Headphones plugin.
+#
+# Installed into this clone by `make install-hooks`, which symlinks it to
+# .git/hooks/pre-commit. It runs the same command CI and reviewers use, so a
+# commit cannot land unlinted or untested. Bypass with `git commit --no-verify`
+# only when you mean it.
+exec make check

@@ -16,9 +16,13 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import errno
 import fcntl
 import json
+import logging
+import logging.handlers
+import math
 import os
 import re
 import socket
@@ -27,7 +31,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 # ---------------------------------------------------------------------------
@@ -52,7 +55,12 @@ MSG_COMMAND_2 = 0x0E
 MAX_MESSAGE_SIZE = 2048
 
 # Sony's app SPP service. Used to recognise a device that speaks this protocol.
+# v1 (WH-1000XM2/XM3/XM4) advertises the first UUID; the v2 generation
+# (WH-1000XM5/XM6, WF-1000XM5, LinkBuds, CH720N…) advertises the second, which
+# the older models do not. Either one identifies a device this helper can ask
+# for a control channel; the init handshake then says which command set it speaks.
 SERVICE_UUID = "96cc203e-5068-46ad-b32d-e316f5e069ba"
+SERVICE_UUID_V2 = "956c7b26-d49a-4ba8-b03f-b17d393cb6e2"
 
 
 class ProtocolError(Exception):
@@ -120,6 +128,98 @@ def decode_message(frame: bytes) -> tuple[int, int, bytes]:
 
 
 # ---------------------------------------------------------------------------
+# Frame trace
+# ---------------------------------------------------------------------------
+#
+# A byte-level trace is the only practical view of a conversation that is
+# otherwise invisible: the helper speaks RFCOMM directly, and a checksum the
+# device rejects or a sequence number it ignores leaves no other mark. Tracing
+# is off unless SONY_HEADPHONES_TRACE asks for it, so an ordinary run pays
+# nothing for the facility.
+#
+# The split between stderr and a file is deliberate rather than a convenience.
+# The browser widget parses its helper's stderr as an error message, so a
+# daemon that traced there would be reported as broken every time it sent a
+# frame; a daemon therefore has to be pointed at a file path. The CLI, whose
+# stderr is read by a human, can simply pass 1. Any other value is taken as a
+# file path and opened in append mode; if it cannot be opened, tracing falls
+# back to disabled rather than turning a debugging aid into a new failure.
+
+
+def _open_trace_file(path):
+    """Open `path` as an append-only trace file private to this user, or None.
+
+    The trace path arrives from the environment, and the ordinary open() that
+    used to be here would follow a symlink parked on it and keep whatever mode
+    the target already had: an arbitrary-file-append primitive. It was
+    replaced with the same hardened open the lock and the log use, O_NOFOLLOW
+    with mode 0600, followed by an fstat that proves the inode is a regular
+    file owned by this user before a byte is written. Any failure returns None
+    and leaves tracing off, because a debugging aid must never become the
+    failure being debugged.
+    """
+    try:
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except (OSError, ValueError):
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError(f"{path} is not a trace file owned by this user")
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a", buffering=1)
+    except (OSError, ValueError):
+        os.close(fd)
+        return None
+
+
+_TRACE_FILE = None
+try:
+    _trace_setting = os.environ.get("SONY_HEADPHONES_TRACE", "")
+    if _trace_setting == "1":
+        _TRACE_FILE = sys.stderr
+    elif _trace_setting not in ("", "0"):
+        _TRACE_FILE = _open_trace_file(_trace_setting)
+except (OSError, ValueError):
+    _TRACE_FILE = None
+
+# The timestamp each line is measured against, so the delta shows the time
+# between frames rather than time since the process started.
+_trace_last = time.monotonic()
+
+
+def trace(direction: str, raw: bytes, decoded=None, note: str = "") -> None:
+    """Write one frame trace line, or nothing at all when tracing is off.
+
+    Never raises and never writes to stdout: the shell parses stdout as JSON,
+    so a failure in the trace must not disturb the conversation it observes.
+    A decodable frame renders as type, sequence, opcode and payload; anything
+    else falls back to the supplied note, or to `undecodable`.
+    """
+    global _trace_last
+    if _TRACE_FILE is None:
+        return
+    try:
+        now = time.monotonic()
+        delta = now - _trace_last
+        _trace_last = now
+        if decoded is not None:
+            msg_type, seq, payload = decoded
+            opcode = f"0x{payload[0]:02x}" if payload else "0x--"
+            detail = f"type={msg_type} seq={seq} opcode={opcode} payload={payload.hex()}"
+        else:
+            detail = note or "undecodable"
+        _TRACE_FILE.write(f"{delta:.3f} {direction} {raw.hex()} {detail}\n")
+        _TRACE_FILE.flush()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Payload opcodes (protocol v1, the "MDR" family: WH-1000XM2/XM3/XM4, WF-SP800N…)
 # ---------------------------------------------------------------------------
 
@@ -142,8 +242,6 @@ ASC_GET = 0x66
 ASC_RET = 0x67
 ASC_SET = 0x68
 ASC_NOTIFY = 0x69
-NC_OPTIMIZER_START = 0x84
-NC_OPTIMIZER_STATUS = 0x85
 NC_OPTIMIZER_STATE_GET = 0x86
 NC_OPTIMIZER_STATE_RET = 0x87
 NC_OPTIMIZER_STATE_NOTIFY = 0x89
@@ -173,6 +271,149 @@ VOICE_NOTIFICATIONS_GET = 0x46
 VOICE_NOTIFICATIONS_RET = 0x47
 VOICE_NOTIFICATIONS_SET = 0x48
 VOICE_NOTIFICATIONS_NOTIFY = 0x49
+
+# ---------------------------------------------------------------------------
+# Payload opcodes (protocol v2: WH-1000XM5/XM6, WF-1000XM5, LinkBuds, CH720N…)
+# ---------------------------------------------------------------------------
+#
+# Same framing and ACK discipline as v1, a different command set. Several
+# numeric opcodes are reused across unrelated features in v2 and told apart by
+# a subtype byte at payload[1], so the constants here name the family and the
+# subtypes sit beside the builders below. Payload layouts follow Gadgetbridge's
+# v2 protocol implementation and were confirmed against a WH-1000XM6 by probing
+# each request and reading the reply.
+V2_INIT_REQUEST = 0x00
+V2_INIT_REPLY = 0x01
+
+# Codec readout uses its own opcode here, different from v1's CODEC_GET family,
+# but the code byte carries the same meaning and is decoded through the shared
+# AUDIO_CODECS table below.
+V2_AUDIO_CODEC_GET = 0x12
+V2_AUDIO_CODEC_RET = 0x13
+V2_AUDIO_CODEC_NOTIFY = 0x15
+
+# A second audio family carries DSEE Extreme and the Bluetooth connection
+# quality, told apart by payload[1]: subtype 0x01 is DSEE Extreme and 0x02 is
+# connection quality. Connection quality is inverted on the wire — 0x00 asks
+# for sound quality (LDAC) and 0x01 for a stable connection (SBC). On v1 the
+# same two features use the opposite subtype split, which is why neither is
+# routed through BOOL_SETTINGS below.
+V2_AUDIO_GET = 0xE6
+V2_AUDIO_RET = 0xE7
+V2_AUDIO_SET = 0xE8
+V2_AUDIO_NOTIFY = 0xE9
+V2_AUDIO_SUB_DSEE = 0x01
+V2_AUDIO_SUB_CONNECTION_QUALITY = 0x02
+V2_CONNECTION_QUALITY_SOUND = 0x00
+V2_CONNECTION_QUALITY_STABLE = 0x01
+
+# The XM6's "listening mode" (standard / background music / cinema) also rides
+# this family, but it is not one value on the wire: Upmix Cinema and Background
+# Music are two independent on/off flags with their own subtypes, and the mode
+# the vendor app shows is derived from them with background music taking
+# priority. Both flags are inverted, so 0x00 means on. Background Music carries
+# a room byte as well, and some firmware answers or sets it under subtype 0x03
+# rather than 0x09.
+V2_AUDIO_SUB_UPMIX_CINEMA = 0x04
+V2_AUDIO_SUB_BGM = 0x09
+V2_AUDIO_SUB_BGM_ALT = 0x03
+V2_BGM_ROOM = {"my-room": 0x00, "living-room": 0x01, "cafe": 0x02}
+V2_BGM_ROOM_FROM_CODE = {v: k for k, v in V2_BGM_ROOM.items()}
+
+V2_BATTERY_GET = 0x22
+V2_BATTERY_RET = 0x23
+V2_BATTERY_NOTIFY = 0x25
+V2_BATTERY_SINGLE = 0x00
+
+V2_EQ_GET = 0x56
+V2_EQ_RET = 0x57
+V2_EQ_SET = 0x58
+V2_EQ_NOTIFY = 0x59
+# The XM6 answers subtype 0x04; 0x00 is the XM5-style dialect.
+V2_EQ_SUBTYPE_DEFAULT = 0x04
+
+V2_ASC_GET = 0x66
+V2_ASC_RET = 0x67
+V2_ASC_SET = 0x68
+V2_ASC_NOTIFY = 0x69
+
+# POWER family: automatic power off duration (subtype 0x05).
+V2_APO_GET = 0x26
+V2_APO_RET = 0x27
+V2_APO_SET = 0x28
+V2_APO_NOTIFY = 0x29
+V2_APO_SUB_AUTO_POWER_OFF = 0x05
+
+# SYSTEM family: pause-when-taken-off (subtype 0x01) and speak-to-chat on/off
+# (subtype 0x0c). GET and SET share the family here, unlike v1.
+V2_SYSTEM_GET = 0xF6
+V2_SYSTEM_RET = 0xF7
+V2_SYSTEM_SET = 0xF8
+V2_SYSTEM_NOTIFY = 0xF9
+V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF = 0x01
+V2_SYSTEM_SUB_SPEAK_TO_CHAT = 0x0C
+
+# Speak-to-chat configuration (sensitivity, resume timeout) rides its own family.
+V2_STC_CONFIG_GET = 0xFA
+V2_STC_CONFIG_RET = 0xFB
+V2_STC_CONFIG_SET = 0xFC
+V2_STC_CONFIG_NOTIFY = 0xFD
+V2_STC_CONFIG_SUB = 0x0C
+
+# PERIPHERAL family, which rides message table 2 rather than table 1: the
+# XM6 lists its Bluetooth multipoint peers and switches which one plays audio
+# through this family, told apart by a subtype byte at payload[1]. The device
+# list is asked for with subtype 0x02 and answered/announced under 0x37/0x39;
+# 0x3C with subtype 0x01 carries the MAC of the peer to make the playback
+# source. Unlike the rest of v2, these frames are MSG_COMMAND_2.
+V2_PERI_GET = 0x36
+V2_PERI_RET = 0x37
+V2_PERI_NOTIFY = 0x39
+V2_PERI_SET_EXTENDED = 0x3C
+V2_PERI_SUB_DEVICE_LIST = 0x02
+V2_PERI_SUB_SOURCE_SWITCH = 0x01
+
+# Ambient sound control subtypes. The device answers whichever dialect its
+# firmware speaks, and writes echo that subtype back rather than assuming one.
+# 0x19 is the current over-ear generation's "noise adaptation" parameter (the
+# XM5/XM6 advertise support function 0x6d for it); 0x17 and 0x15 are the older
+# shapes, and V2_ASC_SUBTYPE_AMBIENT is ambient-only. The subtype is chosen by
+# asking, since a device that supports 0x19 still answers 0x17 out of a dormant
+# legacy slot.
+V2_ASC_SUBTYPE_QUERY = 0x19
+V2_ASC_SUBTYPE_NA = 0x19
+V2_ASC_SUBTYPE_WIND = 0x15
+V2_ASC_SUBTYPE_AMBIENT = 0x22
+
+# Membership only: which subtypes the parser accepts, in no meaningful order.
+V2_ASC_SUBTYPES = (V2_ASC_SUBTYPE_WIND, 0x17, V2_ASC_SUBTYPE_QUERY, V2_ASC_SUBTYPE_AMBIENT)
+
+# The order the handshake tries the dialects in: the query subtype first, then
+# the older shapes in the order they have always been tried. A separate tuple so
+# the membership constant above never doubles as a probe order.
+V2_ASC_PROBE_ORDER = (V2_ASC_SUBTYPE_QUERY, 0x17, V2_ASC_SUBTYPE_WIND, V2_ASC_SUBTYPE_AMBIENT)
+
+# The v2 generation dropped the classic preset table: firmware accepts only
+# these codes, plus Custom. The ten-band curve uses a symmetric gain range
+# stored biased by six.
+V2_EQ_PRESETS = {
+    "off": 0x00,
+    "heavy": 0x30,
+    "clear": 0x31,
+    "hard": 0x32,
+    "soft": 0x33,
+    "custom": 0xA0,
+}
+V2_EQ_PRESET_FROM_CODE = {v: k for k, v in V2_EQ_PRESETS.items()}
+V2_EQ_BAND_COUNT = 10
+V2_EQ_BAND_OFFSET = 6
+V2_EQ_BAND_MIN = -6
+V2_EQ_BAND_MAX = 6
+
+# v2 accepts exactly two automatic-power-off values; the timed options of the
+# older models are rejected on-device.
+V2_AUTO_POWER_OFF = {"when-taken-off": 0x10, "off": 0x11}
+V2_AUTO_POWER_OFF_FROM_CODE = {v: k for k, v in V2_AUTO_POWER_OFF.items()}
 
 NC_MODES = ("off", "noise-cancelling", "wind-noise-reduction", "ambient-sound")
 ASC_MODE_CODE = {"ambient-sound": 0x00, "wind-noise-reduction": 0x01, "noise-cancelling": 0x02}
@@ -216,6 +457,20 @@ STC_TIMEOUT_FROM_CODE = {v: k for k, v in STC_TIMEOUT.items()}
 
 AUDIO_CODECS = {0x00: "unknown", 0x01: "SBC", 0x02: "AAC", 0x10: "LDAC", 0x20: "aptX", 0x21: "aptX HD"}
 
+# The ceiling of each protocol's command set: every control a device speaking
+# that protocol can carry. A per-model set below is a refinement of one of
+# these, never a mix of the two generations.
+V1_FEATURES = {
+    "battery", "equalizer", "dsee", "speak-to-chat", "speak-to-chat-focus",
+    "pause-when-taken-off", "voice-notifications", "auto-power-off",
+    "auto-power-off-timer", "touch-sensor", "nc-optimizer",
+}
+V2_FEATURES = {
+    "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
+    "pause-when-taken-off", "auto-power-off", "listening-mode", "multipoint",
+}
+FEATURE_CEILINGS = {"v1": V1_FEATURES, "v2": V2_FEATURES}
+
 # What each model actually honours, verified against hardware where the status
 # says so and taken from Gadgetbridge's device coordinators otherwise. Sending a
 # command a model ignores is harmless but leaves a dead control on screen, which
@@ -223,33 +478,73 @@ AUDIO_CODECS = {0x00: "unknown", 0x01: "SBC", 0x02: "AAC", 0x10: "LDAC", 0x20: "
 # attempt at disabling its touch panel, and answers "when taken off" to every
 # auto-power-off timer.
 FEATURE_SETS = {
-    "WH-1000XM4": {
-        "battery", "equalizer", "dsee", "speak-to-chat", "pause-when-taken-off",
-        "voice-notifications", "auto-power-off", "nc-optimizer",
+    "v1": {
+        "WH-1000XM4": {
+            "battery", "equalizer", "dsee", "speak-to-chat", "speak-to-chat-focus",
+            "pause-when-taken-off", "voice-notifications", "auto-power-off", "nc-optimizer",
+        },
+        "WH-1000XM3": {
+            "battery", "equalizer", "dsee", "touch-sensor", "voice-notifications",
+            "auto-power-off", "auto-power-off-timer", "nc-optimizer",
+        },
+        "WH-1000XM2": {
+            "battery", "equalizer", "dsee", "nc-optimizer",
+        },
     },
-    "WH-1000XM3": {
-        "battery", "equalizer", "dsee", "touch-sensor", "voice-notifications",
-        "auto-power-off", "auto-power-off-timer", "nc-optimizer",
-    },
-    "WH-1000XM2": {
-        "battery", "equalizer", "dsee", "nc-optimizer",
+    # The v2 generation: no touch panel, voice guidance or NC optimizer in this
+    # command set, and speak-to-chat carries no voice-focus option.
+    "v2": {
+        "WH-1000XM6": {
+            "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
+            "pause-when-taken-off", "auto-power-off", "listening-mode", "multipoint",
+        },
     },
 }
 
-# An unrecognised v1 device gets everything: better to offer a control that
-# turns out to do nothing than to hide one that would have worked.
-ALL_FEATURES = set().union(*FEATURE_SETS.values()) | {"touch-sensor", "auto-power-off-timer"}
+# A model set that strays outside its own generation is a bug, and it should
+# fail here at import rather than by writing an opcode the device cannot route.
+for _protocol, _models in FEATURE_SETS.items():
+    for _model, _model_features in _models.items():
+        _outside = _model_features - FEATURE_CEILINGS[_protocol]
+        if _outside:
+            raise RuntimeError(
+                f"{_model} claims {sorted(_outside)} outside the {_protocol} command set"
+            )
+
+# An unrecognised device gets everything its own protocol can carry; only with
+# no protocol at all is the union offered, because then there is nothing to
+# choose between the two generations.
+ALL_FEATURES = V1_FEATURES | V2_FEATURES
 
 
-def features_for(name: str | None) -> list:
-    for model, features in FEATURE_SETS.items():
-        if model.lower() in str(name or "").lower():
+def features_for(name: str | None, protocol: str | None = None) -> list:
+    """The controls a device should be offered.
+
+    A recognised model gets its own set. When the protocol is known the search
+    stays inside that generation's models, so a name can never pull the other
+    generation's controls in. An unrecognised device gets the whole ceiling of
+    its protocol: the confirmed init handshake once there is one, the
+    bluetoothctl hint before that. Only with neither is the union offered,
+    since the name alone cannot say what the device speaks.
+    """
+    if protocol in FEATURE_SETS:
+        candidates = FEATURE_SETS[protocol]
+    else:
+        candidates = {
+            model: features
+            for models in FEATURE_SETS.values()
+            for model, features in models.items()
+        }
+    text = str(name or "").lower()
+    for model, features in candidates.items():
+        if model.lower() in text:
             return sorted(features)
+    if protocol in FEATURE_CEILINGS:
+        return sorted(FEATURE_CEILINGS[protocol])
     return sorted(ALL_FEATURES)
 
 
 BATTERY_SINGLE = 0x00
-BATTERY_DUAL = 0x01
 BATTERY_CASE = 0x02
 
 
@@ -281,6 +576,19 @@ def refresh_requests() -> list[tuple[int, bytes]]:
     ]
 
 
+def finite_int(value) -> int:
+    """Convert a setting value to int, refusing a non-finite number.
+
+    JSON's parser accepts `Infinity` and `NaN`, and `int(float("inf"))` raises
+    `OverflowError` -- an `ArithmeticError`, not the `ValueError` the command
+    boundary promises -- so the refusal lives here, where the value stops being
+    a plain number.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"expected a finite number, got {value!r}")
+    return int(value)
+
+
 def asc_request(mode: str, level: int, focus_on_voice: bool, supports_wind: bool) -> tuple[int, bytes]:
     """Ambient sound control. One command carries mode, level and voice focus."""
     if mode not in NC_MODES:
@@ -288,7 +596,7 @@ def asc_request(mode: str, level: int, focus_on_voice: bool, supports_wind: bool
     if mode == "wind-noise-reduction" and not supports_wind:
         raise ValueError("this device does not support wind noise reduction")
 
-    level = max(0, min(MAX_AMBIENT_LEVEL, int(level)))
+    level = max(0, min(MAX_AMBIENT_LEVEL, finite_int(level)))
 
     payload = bytearray([ASC_SET, 0x02])
     payload.append(0x00 if mode == "off" else 0x11)
@@ -350,6 +658,224 @@ def stc_config_request(sensitivity: str, focus_on_voice: bool, timeout: str) -> 
     ]))
 
 
+# -- protocol v2 requests ---------------------------------------------------
+
+
+def v2_audio_codec_get() -> tuple[int, bytes]:
+    # Subtype 0x02 selects the codec parameter inside the audio family.
+    return req(bytes([V2_AUDIO_CODEC_GET, 0x02]))
+
+
+def v2_dsee_get() -> tuple[int, bytes]:
+    return req(bytes([V2_AUDIO_GET, V2_AUDIO_SUB_DSEE]))
+
+
+def v2_dsee_request(enabled: bool) -> tuple[int, bytes]:
+    return req(bytes([V2_AUDIO_SET, V2_AUDIO_SUB_DSEE, 0x01 if enabled else 0x00]))
+
+
+def v2_connection_quality_get() -> tuple[int, bytes]:
+    return req(bytes([V2_AUDIO_GET, V2_AUDIO_SUB_CONNECTION_QUALITY]))
+
+
+def v2_connection_quality_request(value: str) -> tuple[int, bytes]:
+    # The shared audio family splits DSEE Extreme (subtype 0x01) from connection
+    # quality (subtype 0x02), and connection quality is inverted: 0x00 is sound
+    # quality (LDAC) and 0x01 is a stable connection (SBC). v1 swaps these two
+    # subtypes, so BOOL_SETTINGS["dsee"] cannot be reused here.
+    if value not in ("sound-quality", "stable"):
+        raise ValueError(f"unknown connection quality {value!r}")
+    code = V2_CONNECTION_QUALITY_SOUND if value == "sound-quality" else V2_CONNECTION_QUALITY_STABLE
+    return req(bytes([V2_AUDIO_SET, V2_AUDIO_SUB_CONNECTION_QUALITY, code]))
+
+
+def v2_cinema_get() -> tuple[int, bytes]:
+    return req(bytes([V2_AUDIO_GET, V2_AUDIO_SUB_UPMIX_CINEMA]))
+
+
+def v2_cinema_request(enabled: bool) -> tuple[int, bytes]:
+    # Inverted on the wire, like the rest of this family: 0x00 turns it on.
+    return req(bytes([V2_AUDIO_SET, V2_AUDIO_SUB_UPMIX_CINEMA, 0x00 if enabled else 0x01]))
+
+
+def v2_bgm_get(subtype: int = V2_AUDIO_SUB_BGM) -> tuple[int, bytes]:
+    return req(bytes([V2_AUDIO_GET, subtype]))
+
+
+def v2_bgm_request(enabled: bool, room_size: str,
+                   subtype: int = V2_AUDIO_SUB_BGM) -> tuple[int, bytes]:
+    # Background Music and Upmix Cinema are two independent flags on the wire,
+    # not one mode value: the app derives standard/background-music/cinema from
+    # them, giving background music priority. Both are inverted, so 0x00 is on.
+    # Background Music also carries the room being simulated, and some firmware
+    # uses subtype 0x03 rather than 0x09, so the device's own subtype is echoed.
+    if room_size not in V2_BGM_ROOM:
+        raise ValueError(
+            f"unknown room size {room_size!r}; expected one of {', '.join(V2_BGM_ROOM)}"
+        )
+    return req(bytes([
+        V2_AUDIO_SET,
+        subtype,
+        0x00 if enabled else 0x01,
+        V2_BGM_ROOM[room_size],
+    ]))
+
+
+def v2_asc_request(mode: str, level: int, focus_on_voice: bool,
+                   subtype: int = V2_ASC_SUBTYPE_QUERY,
+                   auto_ambient: int = 0x00, noise_adapt_sensitivity: int = 0x00):
+    """Ambient sound control. Mode, level and voice focus in one command.
+
+    Each subtype carries the same core bytes in the same order and differs in
+    what follows: 0x19 appends the noise-adaptation fields, 0x15 inserts a wind
+    byte, and 0x22 is ambient-only. The device's own subtype is echoed back so
+    we always speak whichever dialect it answered under.
+    """
+    if mode not in NC_MODES:
+        raise ValueError(f"unknown mode {mode!r}; expected one of {', '.join(NC_MODES)}")
+    if mode == "wind-noise-reduction" and subtype != V2_ASC_SUBTYPE_WIND:
+        raise ValueError("this device does not support wind noise reduction")
+
+    level = max(0, min(MAX_AMBIENT_LEVEL, finite_int(level)))
+    # Ambient at zero is "off" with extra steps; the vendor app never sends it.
+    if mode == "ambient-sound" and level == 0:
+        level = 1
+    on_off = 0x00 if mode == "off" else 0x01
+    ambient = 0x01 if mode == "ambient-sound" else 0x00
+    focus = 0x01 if focus_on_voice else 0x00
+
+    if subtype == V2_ASC_SUBTYPE_NA:
+        payload = [
+            V2_ASC_SET, subtype, 0x01, on_off, ambient, focus, level,
+            auto_ambient & 0x01, noise_adapt_sensitivity,
+        ]
+    elif subtype == V2_ASC_SUBTYPE_WIND:
+        payload = [
+            V2_ASC_SET, subtype, 0x01, on_off, ambient,
+            0x03 if mode == "wind-noise-reduction" else 0x02, focus, level,
+        ]
+    elif subtype == V2_ASC_SUBTYPE_AMBIENT:
+        payload = [V2_ASC_SET, subtype, 0x01, on_off, 0x01, focus, level]
+    else:
+        payload = [V2_ASC_SET, subtype, 0x01, on_off, ambient, focus, level]
+    return req(bytes(payload))
+
+
+def v2_asc_get(subtype: int = V2_ASC_SUBTYPE_QUERY) -> tuple[int, bytes]:
+    return req(bytes([V2_ASC_GET, subtype]))
+
+
+def v2_eq_get(subtype: int = V2_EQ_SUBTYPE_DEFAULT) -> tuple[int, bytes]:
+    return req(bytes([V2_EQ_GET, subtype]))
+
+
+def v2_eq_preset_request(preset: str, subtype: int = V2_EQ_SUBTYPE_DEFAULT) -> tuple[int, bytes]:
+    if preset not in V2_EQ_PRESETS:
+        raise ValueError(f"unknown equalizer preset {preset!r}")
+    return req(bytes([V2_EQ_SET, subtype, V2_EQ_PRESETS[preset], 0x00]))
+
+
+def v2_eq_bands_request(bands: list[int], subtype: int = V2_EQ_SUBTYPE_DEFAULT) -> tuple[int, bytes]:
+    if len(bands) != V2_EQ_BAND_COUNT:
+        raise ValueError(f"expected {V2_EQ_BAND_COUNT} equalizer bands")
+    for value in bands:
+        if value < V2_EQ_BAND_MIN or value > V2_EQ_BAND_MAX:
+            raise ValueError(
+                f"equalizer values must be between {V2_EQ_BAND_MIN} and {V2_EQ_BAND_MAX}"
+            )
+    return req(bytes(
+        [V2_EQ_SET, subtype, V2_EQ_PRESETS["custom"], V2_EQ_BAND_COUNT]
+        + [v + V2_EQ_BAND_OFFSET for v in bands]
+    ))
+
+
+def v2_system_get(sub: int) -> tuple[int, bytes]:
+    return req(bytes([V2_SYSTEM_GET, sub]))
+
+
+def v2_stc_enabled_request(enabled: bool) -> tuple[int, bytes]:
+    # Inverted on v2: 0x00 enables.
+    return req(bytes([V2_SYSTEM_SET, V2_SYSTEM_SUB_SPEAK_TO_CHAT,
+                      0x00 if enabled else 0x01, 0x01]))
+
+
+def v2_bool_request(opcode: int, sub: int, enabled: bool) -> tuple[int, bytes]:
+    return req(bytes([opcode, sub, 0x00 if enabled else 0x01]))
+
+
+def v2_stc_config_request(sensitivity: str, timeout: str) -> tuple[int, bytes]:
+    if sensitivity not in STC_SENSITIVITY:
+        raise ValueError(f"unknown speak-to-chat sensitivity {sensitivity!r}")
+    if timeout not in STC_TIMEOUT:
+        raise ValueError(f"unknown speak-to-chat timeout {timeout!r}")
+    return req(bytes([
+        V2_STC_CONFIG_SET,
+        V2_STC_CONFIG_SUB,
+        STC_SENSITIVITY[sensitivity],
+        STC_TIMEOUT[timeout],
+    ]))
+
+
+def v2_auto_power_off_request(value: str) -> tuple[int, bytes]:
+    if value not in V2_AUTO_POWER_OFF:
+        raise ValueError(
+            f"unknown auto power off value {value!r}; expected 'off' or 'when-taken-off'"
+        )
+    return req(bytes([V2_APO_SET, V2_APO_SUB_AUTO_POWER_OFF, V2_AUTO_POWER_OFF[value], 0x00]))
+
+
+def v2_stc_get() -> tuple[int, bytes]:
+    return req(bytes([V2_STC_CONFIG_GET, V2_STC_CONFIG_SUB]))
+
+
+def v2_apo_get() -> tuple[int, bytes]:
+    return req(bytes([V2_APO_GET, V2_APO_SUB_AUTO_POWER_OFF]))
+
+
+def v2_device_list_get() -> tuple[int, bytes]:
+    # Multipoint device list, asked on message table 2 under subtype 0x02.
+    return req(bytes([V2_PERI_GET, V2_PERI_SUB_DEVICE_LIST]), MSG_COMMAND_2)
+
+
+def v2_source_switch_request(address: str) -> tuple[int, bytes]:
+    # Hands playback to one paired peer by MAC. The address is always written
+    # as 17 uppercase-agnostic ASCII MAC bytes after the two opcode bytes.
+    if not MAC_RE.match(address):
+        raise ValueError(f"invalid Bluetooth address {address!r}")
+    return req(bytes([V2_PERI_SET_EXTENDED, V2_PERI_SUB_SOURCE_SWITCH]) + address.encode("ascii"),
+               MSG_COMMAND_2)
+
+
+def v2_refresh_requests(subtype: int = V2_ASC_SUBTYPE_QUERY,
+                        eq_subtype: int = V2_EQ_SUBTYPE_DEFAULT,
+                        bgm_subtype: int = V2_AUDIO_SUB_BGM) -> list[tuple[int, bytes]]:
+    """Everything worth asking for after a v2 connect, in display order.
+
+    Ambient sound is asked under the subtype the device answered during the
+    handshake, so a device that supports noise adaptation (0x19) is never
+    misread through the dormant legacy parameter it also answers. Equalizer and
+    background music are asked under their own discovered subtypes for the same
+    reason.
+    """
+    return [
+        req(bytes([V2_BATTERY_GET, V2_BATTERY_SINGLE])),
+        v2_audio_codec_get(),
+        # v2 firmware is still read with the v1 opcode, subtype 0x02.
+        req(bytes([FW_VERSION_REQUEST, 0x02])),
+        v2_asc_get(subtype),
+        v2_eq_get(eq_subtype),
+        v2_system_get(V2_SYSTEM_SUB_SPEAK_TO_CHAT),
+        v2_system_get(V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF),
+        v2_apo_get(),
+        v2_stc_get(),
+        v2_dsee_get(),
+        v2_connection_quality_get(),
+        v2_bgm_get(bgm_subtype),
+        v2_cinema_get(),
+        v2_device_list_get(),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Replies
 # ---------------------------------------------------------------------------
@@ -359,9 +885,88 @@ def _bool(value: int):
     return {0x00: False, 0x01: True}.get(value)
 
 
+def derive_listening_mode(bgm_enabled: bool, cinema_enabled: bool) -> str:
+    """The mode the app shows, from the two independent wire flags.
+
+    Background Music takes priority over Upmix Cinema when both somehow read as
+    on, matching the vendor app, so exactly one of the three modes is reported.
+    """
+    if bgm_enabled:
+        return "background-music"
+    if cinema_enabled:
+        return "cinema"
+    return "standard"
+
+
+def parse_v2_device_list(payload: bytes):
+    """Decode a multipoint device list from v2's PERIPHERAL family.
+
+    This family rides message table 2 (MSG_COMMAND_2), not table 1. Layout is
+    [opcode, subtype, count, entries..., playbackStatus]: the subtype says
+    whether each entry carries a 3-byte class-of-device (0x02) or not (0x00),
+    and the trailing byte names the peer that currently owns playback. An entry
+    is 17 ASCII MAC bytes, one connected-status byte, the optional class bytes,
+    then a one-byte name length followed by that many UTF-8 name bytes. A
+    device is the active playback source when it is connected and its status
+    byte equals the trailing playbackStatus. Malformed or truncated input
+    yields None so the caller can leave the previous state alone.
+    """
+    if len(payload) < 4 or payload[1] not in (0x00, 0x02):
+        return None
+    with_class = payload[1] == 0x02
+    count = payload[2]
+    if not 0 < count < 16:
+        return [] if count == 0 else None
+    playback_status = payload[-1]
+
+    devices = []
+    index = 3
+    for _ in range(count):
+        if index + 17 > len(payload):
+            return None
+        address = payload[index:index + 17].decode("utf-8", "replace")
+        index += 17
+        if not MAC_RE.match(address):
+            # The peer address is attacker-controlled and also seeds the name
+            # fallback, so a non-MAC value is replaced before either is stored.
+            address = "unknown"
+        if index >= len(payload):
+            return None
+        status = payload[index]
+        index += 1
+        if with_class:
+            if index + 3 > len(payload):
+                return None
+            index += 3
+        if index >= len(payload):
+            return None
+        name_length = payload[index]
+        index += 1
+        # Leave at least the trailing playbackStatus byte for the next read.
+        if index + name_length >= len(payload):
+            return None
+        name_bytes = payload[index:index + name_length]
+        index += name_length
+        try:
+            name = name_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            name = address
+        name = _clean_name(name, address)
+        connected = status != 0
+        devices.append({
+            "address": address,
+            "name": name,
+            "connected": connected,
+            "playback": connected and status == playback_status,
+        })
+    return devices
+
+
 def initial_state() -> dict:
     return {
         "connected": False,
+        # "v1" or "v2" once the init handshake has said which; None before that.
+        "protocol": None,
         "address": None,
         "name": None,
         "firmware": None,
@@ -372,10 +977,25 @@ def initial_state() -> dict:
         "ambient_level": None,
         "focus_on_voice": None,
         "supports_wind": None,
+        "asc_subtype": None,
+        "asc_auto_ambient": None,
+        "asc_noise_adapt_sensitivity": None,
         "eq_preset": None,
         "eq_bass": None,
         "eq_bands": None,
+        "eq_band_count": None,
+        "eq_subtype": None,
         "dsee": None,
+        "connection_quality": None,
+        "listening_mode": None,
+        # Multipoint peers and whichever one currently owns playback, both
+        # filled from the PERIPHERAL device-list family on protocol v2.
+        "devices": None,
+        "playback_source": None,
+        "bgm_room_size": None,
+        "bgm_subtype": None,
+        "bgm_enabled": False,
+        "cinema_enabled": False,
         "speak_to_chat": None,
         "stc_sensitivity": None,
         "stc_focus_on_voice": None,
@@ -385,9 +1005,57 @@ def initial_state() -> dict:
         "touch_sensor": None,
         "voice_notifications": None,
         "nc_optimizer_pressure": None,
-        "features": sorted(ALL_FEATURES),
+        "features": [],
         "error": None,
+        # Write-then-verify. `pending` lists the setting keys that have been
+        # written but not yet confirmed by the device's own read-back; `refused`
+        # maps a key the device acknowledged without changing to a short reason.
+        # Both are separate from `error`, which is for connection-level
+        # failures only, so a discarded write keeps its association with a row.
+        "pending": [],
+        "refused": {},
+        # The control-session policy and whether the daemon currently holds the
+        # session. The daemon owns these fields and stamps the live values on
+        # at its boundary; a bare link reports the neutral held/hold/30.
+        "session": "held",
+        "session_policy": SESSION_POLICY_DEFAULT,
+        "session_idle": SESSION_IDLE_DEFAULT,
+        # The helper's own log level. It rides in the state so the panel can
+        # read it — and change it over the socket — the same way as anything
+        # the headphones report.
+        "logging": log_level(),
     }
+
+
+def _apply_firmware(state: dict, payload: bytes) -> None:
+    """Record the firmware string; both generations read it through v1's opcode."""
+    version = payload[3:].decode("ascii", "replace")
+    if re.fullmatch(r"[0-9.\-a-zA-Z_]+", version):
+        state["firmware"] = version
+
+
+def _apply_codec(state: dict, payload: bytes) -> None:
+    """Record the codec byte; both generations index it through AUDIO_CODECS."""
+    state["codec"] = AUDIO_CODECS.get(payload[2], f"0x{payload[2]:02x}")
+
+
+def _apply_battery(state: dict, payload: bytes, subtypes: tuple[int, ...],
+                   minimum: int | None = None, maximum: int | None = None) -> None:
+    """Record battery percentage and charging flag.
+
+    v1 accepts the single/case subtypes with no bound on the percentage; v2
+    accepts only the single subtype and bounds it to 0..100. Callers have
+    already checked the payload length.
+    """
+    if payload[1] not in subtypes:
+        return
+    level = payload[2]
+    if minimum is not None and level < minimum:
+        return
+    if maximum is not None and level > maximum:
+        return
+    state["battery"] = level
+    state["charging"] = payload[3] == 0x01
 
 
 def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
@@ -409,17 +1077,13 @@ def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
         return state != before
 
     if code == FW_VERSION_REPLY and len(payload) >= 4 and payload[1] == 0x02:
-        version = payload[3:].decode("ascii", "replace")
-        if re.fullmatch(r"[0-9.\-a-zA-Z_]+", version):
-            state["firmware"] = version
+        _apply_firmware(state, payload)
 
     elif code in (CODEC_RET, CODEC_NOTIFY) and len(payload) == 3:
-        state["codec"] = AUDIO_CODECS.get(payload[2], f"0x{payload[2]:02x}")
+        _apply_codec(state, payload)
 
     elif code in (BATTERY_RET, BATTERY_NOTIFY) and len(payload) >= 4:
-        if payload[1] in (BATTERY_SINGLE, BATTERY_CASE):
-            state["battery"] = payload[2]
-            state["charging"] = payload[3] == 0x01
+        _apply_battery(state, payload, (BATTERY_SINGLE, BATTERY_CASE))
 
     elif code in (ASC_RET, ASC_NOTIFY) and len(payload) == 8:
         supports_wind = payload[3] == 0x02
@@ -479,6 +1143,141 @@ def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
     return state != before
 
 
+def apply_payload_v2(state: dict, msg_type: int, payload: bytes) -> bool:
+    """Fold one v2 reply or notification into `state`. Returns True if anything moved.
+
+    Like the v1 parser, unknown or malformed payloads are ignored rather than
+    raising: the headphones emit plenty of chatter this plugin has no use for.
+    """
+    if not payload:
+        return False
+
+    before = dict(state)
+    code = payload[0]
+
+    # The multipoint device list rides message table 2 on v2, so it is read
+    # here: the v1 parser handles MSG_COMMAND_2 only for voice notifications
+    # and is never reached on a v2 link.
+    if msg_type == MSG_COMMAND_2:
+        if code in (V2_PERI_RET, V2_PERI_NOTIFY):
+            devices = parse_v2_device_list(payload)
+            if devices is not None:
+                state["devices"] = devices
+                state["playback_source"] = next(
+                    (device["address"] for device in devices if device["playback"]), None)
+        return state != before
+
+    # v2 still reads firmware through the v1 opcode, so the branch has to live
+    # here: a v2 link is routed exclusively to this parser and never reaches the
+    # v1 one, where the identical check sits for older devices.
+    if code == FW_VERSION_REPLY and len(payload) >= 4 and payload[1] == 0x02:
+        _apply_firmware(state, payload)
+
+    elif code in (V2_AUDIO_CODEC_RET, V2_AUDIO_CODEC_NOTIFY) and len(payload) == 3 and payload[1] == 0x02:
+        _apply_codec(state, payload)
+
+    elif code in (V2_AUDIO_RET, V2_AUDIO_NOTIFY) and len(payload) >= 3:
+        sub = payload[1]
+        if sub == V2_AUDIO_SUB_DSEE and len(payload) == 3 and payload[2] in (0, 1):
+            state["dsee"] = payload[2] == 0x01
+        elif sub == V2_AUDIO_SUB_CONNECTION_QUALITY and len(payload) == 3 and payload[2] in (0, 1):
+            state["connection_quality"] = "stable" if payload[2] == 0x01 else "sound-quality"
+        elif sub == V2_AUDIO_SUB_UPMIX_CINEMA and len(payload) == 3:
+            # Upmix Cinema is inverted: 0x00 means on.
+            state["cinema_enabled"] = payload[2] == 0x00
+            state["listening_mode"] = derive_listening_mode(
+                state.get("bgm_enabled"), state["cinema_enabled"])
+        elif sub in (V2_AUDIO_SUB_BGM, V2_AUDIO_SUB_BGM_ALT) and len(payload) >= 4:
+            room = V2_BGM_ROOM_FROM_CODE.get(payload[3])
+            if room is not None:
+                # Background Music is inverted too, and carries the room byte.
+                state["bgm_enabled"] = payload[2] == 0x00
+                state["bgm_room_size"] = room
+                state["bgm_subtype"] = sub
+                state["listening_mode"] = derive_listening_mode(
+                    state["bgm_enabled"], state.get("cinema_enabled"))
+
+    if code in (V2_BATTERY_RET, V2_BATTERY_NOTIFY) and len(payload) >= 4:
+        _apply_battery(state, payload, (V2_BATTERY_SINGLE,), minimum=0, maximum=100)
+
+    elif code in (V2_ASC_RET, V2_ASC_NOTIFY) and len(payload) >= 6:
+        subtype = payload[1]
+        if subtype in V2_ASC_SUBTYPES:
+            on_off = payload[3]
+            has_wind = subtype == V2_ASC_SUBTYPE_WIND
+            if subtype == V2_ASC_SUBTYPE_NA and len(payload) >= 9:
+                # [type, status, onOff, ncAsmMode, focus, level, auto, sensitivity]
+                ambient, focus, level = payload[4], payload[5], payload[6]
+                auto_ambient, sensitivity = payload[7], payload[8]
+            else:
+                # The shorter shapes end in focus and level; the ambient-only
+                # subtype carries no ambient byte of its own.
+                ambient = 0x01 if subtype == V2_ASC_SUBTYPE_AMBIENT else payload[4]
+                focus, level = payload[-2], payload[-1]
+                auto_ambient, sensitivity = None, None
+            if on_off == 0x00:
+                mode = "off"
+            elif subtype == V2_ASC_SUBTYPE_AMBIENT or ambient == 0x01:
+                mode = "ambient-sound"
+            else:
+                mode = "noise-cancelling"
+            if focus in (0x00, 0x01) and 0 <= level <= MAX_AMBIENT_LEVEL:
+                state["supports_wind"] = has_wind
+                state["asc_subtype"] = subtype
+                state["nc_mode"] = mode
+                state["ambient_level"] = level
+                state["focus_on_voice"] = focus == 0x01
+                if auto_ambient is not None:
+                    state["asc_auto_ambient"] = auto_ambient == 0x01
+                    state["asc_noise_adapt_sensitivity"] = sensitivity
+
+    elif code in (V2_EQ_RET, V2_EQ_NOTIFY) and len(payload) >= 4:
+        subtype = payload[1]
+        band_count = payload[3]
+        if subtype in (0x00, 0x02, 0x04) and 4 + band_count <= len(payload):
+            # Six-band replies use the classic offset-ten layout; ten-band use six.
+            offset = 10 if band_count == 6 else V2_EQ_BAND_OFFSET
+            state["eq_preset"] = V2_EQ_PRESET_FROM_CODE.get(payload[2])
+            state["eq_bass"] = None
+            state["eq_bands"] = [payload[4 + i] - offset for i in range(band_count)]
+            state["eq_band_count"] = band_count
+            state["eq_subtype"] = subtype
+
+    elif code in (V2_SYSTEM_RET, V2_SYSTEM_NOTIFY) and len(payload) >= 2:
+        sub = payload[1]
+        if sub == V2_SYSTEM_SUB_SPEAK_TO_CHAT and len(payload) == 4:
+            disabled = payload[2]
+            if disabled in (0x00, 0x01):
+                state["speak_to_chat"] = disabled == 0x00
+        elif sub == V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF and len(payload) == 3:
+            disabled = payload[2]
+            if disabled in (0x00, 0x01):
+                state["pause_when_taken_off"] = disabled == 0x00
+
+    elif code in (V2_APO_RET, V2_APO_NOTIFY) and len(payload) >= 2:
+        sub = payload[1]
+        if sub == V2_APO_SUB_AUTO_POWER_OFF and len(payload) == 4:
+            value = V2_AUTO_POWER_OFF_FROM_CODE.get(payload[2])
+            if value is not None:
+                state["auto_power_off"] = value
+        elif sub == V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF and len(payload) == 3:
+            # Some firmware answers pause-when-taken-off on the POWER family.
+            disabled = payload[2]
+            if disabled in (0x00, 0x01):
+                state["pause_when_taken_off"] = disabled == 0x00
+
+    elif code in (V2_STC_CONFIG_RET, V2_STC_CONFIG_NOTIFY) and len(payload) == 4:
+        if payload[1] == V2_STC_CONFIG_SUB:
+            sensitivity = STC_SENSITIVITY_FROM_CODE.get(payload[2])
+            timeout = STC_TIMEOUT_FROM_CODE.get(payload[3])
+            if sensitivity is not None:
+                state["stc_sensitivity"] = sensitivity
+            if timeout is not None:
+                state["stc_timeout"] = timeout
+
+    return state != before
+
+
 # ---------------------------------------------------------------------------
 # SDP: which RFCOMM channel is the control service on?
 # ---------------------------------------------------------------------------
@@ -494,6 +1293,7 @@ SDP_SERVICE_SEARCH_ATTR_REQUEST = 0x06
 SDP_SERVICE_SEARCH_ATTR_RESPONSE = 0x07
 RFCOMM_PROTOCOL_UUID = 0x0003
 SERVICE_UUID_BYTES = bytes.fromhex(SERVICE_UUID.replace("-", ""))
+SERVICE_UUID_V2_BYTES = bytes.fromhex(SERVICE_UUID_V2.replace("-", ""))
 
 # The device decides how long this exchange runs and how much it sends, so both
 # are capped here rather than left to it. A real answer is a few hundred bytes
@@ -572,11 +1372,17 @@ def _parse_element(data: bytes, index: int, depth: int = 0):
 
 
 def _find_rfcomm_channel(node):
-    """A protocol descriptor is [RFCOMM uuid, channel]; find the first one."""
+    """A protocol descriptor is [RFCOMM uuid, channel]; find the first one.
+
+    The channel is the device's to name and SDP is unauthenticated, so only
+    the range an RFCOMM socket address can carry is accepted: an out-of-range
+    value is treated as no channel at all.
+    """
     if not isinstance(node, list):
         return None
     if (len(node) >= 2 and isinstance(node[0], tuple) and node[0][0] == "uuid"
-            and node[0][1] == RFCOMM_PROTOCOL_UUID and isinstance(node[1], int)):
+            and node[0][1] == RFCOMM_PROTOCOL_UUID and isinstance(node[1], int)
+            and 1 <= node[1] <= 30):
         return node[1]
     for child in node:
         found = _find_rfcomm_channel(child)
@@ -691,6 +1497,29 @@ CACHE_DIR = os.path.join(
 
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", re.IGNORECASE)
 
+_NAME_WHITESPACE_RE = re.compile(r"\s+")
+_NAME_CONTROLS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean_name(text: str, fallback: str) -> str:
+    """Make a device- or peer-supplied name inert single-line text.
+
+    The remote device chooses its own friendly name, and it is fully
+    attacker-controlled: it can carry ANSI/OSC escape sequences, newlines,
+    C0/C1 controls or an unbounded length. That text reaches a terminal (OSC
+    52 rewrites the clipboard, OSC 8 spoofs links), the log (a newline forges
+    an entry) and shared QML components whose textFormat this repo does not
+    control (Qt's rich text can load remote images). Strip controls, squeeze
+    whitespace to single spaces, bound the length and fall back to the address
+    when nothing readable survives. This is control/format neutrality, not
+    ASCII folding: legitimate Unicode letters are meant to pass through.
+    """
+    if not text:
+        return fallback
+    collapsed = _NAME_WHITESPACE_RE.sub(" ", text)
+    cleaned = _NAME_CONTROLS_RE.sub("", collapsed).strip()[:64].strip()
+    return cleaned or fallback
+
 
 # Where BlueZ actually installs bluetoothctl. The daemon is long-lived and
 # inherits whatever environment started the bar, so resolving the name through
@@ -727,18 +1556,125 @@ def bluetoothctl(*args: str, timeout: float = 5.0) -> str:
     return done.stdout
 
 
-def connected_devices() -> list[dict]:
-    """Connected Bluetooth devices that advertise Sony's app service."""
+INFO_MAX_LINES = 256  # one device's `bluetoothctl info` is a few dozen lines
+
+
+def service_protocol(info: str) -> str | None:
+    """Which command set a device's SDP record says it speaks, or None.
+
+    BlueZ lists the remote service UUIDs in `bluetoothctl info`, so this is a
+    cheap lookup. The v2 UUID is checked first: a device that advertises it (and
+    none do both) speaks v2.
+
+    Only indented `UUID:` lines count, except when the dump's first line is
+    the UUID line itself. `bluetoothctl info` prints the `Name:`/`Alias:`
+    value verbatim, so a hostile friendly name containing a newline plus
+    `UUID: <sony-uuid>` starts a fresh unindented line that a
+    strip-then-match would trust. Genuine property lines always carry BlueZ's
+    leading-tab indentation (only the `Device ...` header starts at column
+    zero, and never with a UUID), so requiring the tab tells a real UUID
+    property apart from name content spilling onto a later line. A bare
+    first line cannot be such spillover — spillover always follows the
+    `Name:`/`Alias:` line — so it keeps the historical single-line match.
+    The scan covers at most INFO_MAX_LINES lines.
+    """
+    uuids = []
+    for index, line in enumerate(info.splitlines()[:INFO_MAX_LINES]):
+        stripped = line.strip().lower()
+        if not stripped.startswith("uuid:"):
+            continue
+        if line.startswith("\t") or index == 0:
+            uuids.append(stripped)
+    text = "\n".join(uuids)
+    if SERVICE_UUID_V2 in text:
+        return "v2"
+    if SERVICE_UUID in text:
+        return "v1"
+    return None
+
+
+# How long a connected-device list is trusted. The daemon retries every 2-30 s
+# while nothing is connected, so this is the window that collapses one
+# operation's several lookups (find_device inside try_connect inside run, plus
+# a scan per device) into a single one. It has to stay short: a just-connected
+# device must appear promptly, so nothing negative is remembered for longer.
+DISCOVERY_TTL = 2.0
+
+
+def _normalize_mac(address: str) -> str:
+    """A stable key for an address regardless of case or separators."""
+    return address.replace(":", "").lower()
+
+
+class _DiscoveryCache:
+    """In-memory discovery cache — never on disk.
+
+    A persisted protocol hint would be attacker-influenceable without the
+    private-directory and O_NOFOLLOW treatment the channel cache gets, and it
+    buys nothing: the hint only orders UUID queries and Link's init handshake
+    overwrites it. So this is a plain dict in the process.
+
+    The list is time-limited so a device that just connected is picked up after
+    the TTL; the per-MAC protocol hint lasts for the process lifetime, because
+    a present device keeps advertising the same service. A search that finds no
+    Sony service stores no hint, so it can be answered afresh next scan.
+    """
+
+    def __init__(self, ttl: float = DISCOVERY_TTL, clock=time.monotonic):
+        self.ttl = ttl
+        self._clock = clock
+        self._devices = None  # (expiry, snapshot)
+        self._hints = {}      # normalized MAC -> "v1" | "v2"
+
+    def cached_devices(self) -> list[dict] | None:
+        if self._devices is not None and self._clock() < self._devices[0]:
+            return self._devices[1]
+        return None
+
+    def remember_devices(self, devices: list[dict]) -> None:
+        self._devices = (self._clock() + self.ttl, devices)
+
+    def protocol_hint(self, address: str) -> str | None:
+        return self._hints.get(_normalize_mac(address))
+
+    def remember_protocol(self, address: str, protocol: str | None) -> None:
+        # Only a positive answer is kept: a device with no advertised service
+        # may grow one, and must not be pinned to "none" for the process.
+        if protocol is not None:
+            self._hints[_normalize_mac(address)] = protocol
+
+
+_DISCOVERY = _DiscoveryCache()
+
+
+def connected_devices(*, live: bool = False) -> list[dict]:
+    """Connected Bluetooth devices that advertise a Sony app service.
+
+    The result is cached in memory for a couple of seconds so a burst of calls
+    from one operation collapses to a single scan. `live=True` deliberately
+    bypasses the cache for diagnostics that want a fresh view; the protocol is
+    still only a hint — Link's init handshake is what decides it.
+    """
+    if not live:
+        cached = _DISCOVERY.cached_devices()
+        if cached is not None:
+            return cached
     devices = []
     for line in bluetoothctl("devices", "Connected").splitlines():
         parts = line.split(None, 2)
         if len(parts) < 2 or parts[0] != "Device" or not MAC_RE.match(parts[1]):
             continue
         address = parts[1]
-        name = parts[2].strip() if len(parts) > 2 else address
-        info = bluetoothctl("info", address)
-        if SERVICE_UUID in info.lower():
-            devices.append({"address": address, "name": name})
+        name = _clean_name(parts[2] if len(parts) > 2 else address, address)
+        protocol = None if live else _DISCOVERY.protocol_hint(address)
+        if protocol is None:
+            protocol = service_protocol(bluetoothctl("info", address))
+            if not live:
+                _DISCOVERY.remember_protocol(address, protocol)
+        if protocol is not None:
+            devices.append({"address": address, "name": name, "protocol": protocol})
+    if not live:
+        _DISCOVERY.remember_devices(devices)
     return devices
 
 
@@ -753,7 +1689,7 @@ def find_device(preferred: str | None = None) -> dict | None:
 
 
 def _channel_cache_path(address: str) -> str:
-    return os.path.join(CACHE_DIR, address.replace(":", "").lower() + ".channel")
+    return os.path.join(CACHE_DIR, _normalize_mac(address) + ".channel")
 
 
 def cached_channel(address: str) -> int | None:
@@ -817,6 +1753,193 @@ def forget_channel(address: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The local log
+# ---------------------------------------------------------------------------
+#
+# A human-readable companion to the frame trace. The trace is a byte-level
+# view of one conversation, switched on for a run; the log is a bounded,
+# always-there record of what the helper did, for when a puzzle has to be
+# worked out after the fact. Both are local-only: the log never goes to stdout
+# (the shell parses stdout as JSON), never to stderr (the widget reads its
+# helper's stderr as an error message), and never over the network.
+#
+# The design follows the stdlib logging practice that fits a single-file
+# helper. One module-level named logger, never the root logger, so a record
+# cannot end up in another application's handlers. Lazy "message %s"
+# formatting, so the arguments are only stringified when a record is really
+# emitted. One RotatingFileHandler with small bounds, because a log is a
+# debugging aid and not a record of everything. Configuration happens once, at
+# startup, from SONY_HEADPHONES_LOG; a runtime change moves the handler's
+# level alone, which needs no reconfiguration and no threads.
+#
+# The user-facing names are the three the panel offers. `off` is a level above
+# CRITICAL, so nothing can be emitted; `errors` keeps failures, the parser
+# boundary and lost links; `all` adds the connection lifecycle and every
+# command applied. Anything that is not a known name means `errors`, so a typo
+# can never silence the log.
+#
+# The file lives in the same private cache directory as the channel cache and
+# is opened the same way the lock is: O_NOFOLLOW, 0600, and checked to be ours
+# before a byte is written. A symlink parked on the name, or a file someone
+# else can read, would each be a way to redirect or watch what the helper
+# writes. The file itself is created on the first record, so a run that logs
+# nothing touches nothing. Bluetooth addresses are redacted from every
+# formatted line; the frame trace remains the one channel that carries raw
+# bytes, and it stays opt-in.
+
+LOG_FILE_NAME = "sony-headphones.log"
+LOG_MAX_BYTES = 256 * 1024
+LOG_BACKUPS = 2
+LOG_DEFAULT = "errors"
+# Above CRITICAL, so no record can pass a handler carrying this level.
+LOG_OFF = logging.CRITICAL + 10
+LOG_LEVELS = {"off": LOG_OFF, "errors": logging.ERROR, "all": logging.DEBUG}
+
+# A fixed name rather than __name__, which is "__main__" when the helper runs
+# as a script and something else when a test loads the file: the log belongs
+# to the helper, not to whoever imported it.
+LOG = logging.getLogger("sony-headphones")
+# Until configure_logging runs there is nowhere to write. The NullHandler is
+# the stdlib idiom that keeps a record from falling through to the root
+# logger's lastResort handler, which would print it to stderr.
+LOG.addHandler(logging.NullHandler())
+LOG.propagate = False
+
+
+class _LogFormatter(logging.Formatter):
+    """A formatter that redacts Bluetooth addresses and keeps one line per record.
+
+    The address is a stable hardware identifier and nothing the log answers
+    needs it. Redacting in the formatter also catches an address embedded in
+    an exception message or its traceback, which rewriting the record's
+    arguments would miss. Stripping controls here does the same for CR/LF: a
+    device name or a command value carrying a newline would otherwise forge
+    log entries, and the formatter is the one place every record crosses.
+    """
+
+    # MAC_RE's anchors make it a validator; this one has to find an address
+    # anywhere in a line.
+    ADDRESS = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+
+    def format(self, record):
+        # Strip controls from the message text only, so a value carrying a
+        # newline cannot forge an entry, then format a copy: the exception and
+        # stack text that Formatter appends keeps its own newlines, which a
+        # traceback needs. Formatting a copy leaves the original record for
+        # any other handler.
+        message = _NAME_CONTROLS_RE.sub("", record.getMessage())
+        record = logging.makeLogRecord(record.__dict__)
+        record.msg = message
+        record.args = ()
+        line = super().format(record)
+        return self.ADDRESS.sub("<address>", line)
+
+
+class _PrivateLogFile(logging.handlers.RotatingFileHandler):
+    """A rotating handler that opens its file the way the lock is opened.
+
+    RotatingFileHandler would open the log by name through the builtin open,
+    following a symlink parked on the path and keeping whatever mode the file
+    happened to have. O_NOFOLLOW, an owner check and fchmod make the file
+    private or fail. Overriding _open also covers rotation, because
+    doRollover reopens through the same method, and the delayed open keeps the
+    cache directory untouched until the first record is actually emitted.
+    """
+
+    def _open(self):
+        # The private-cache check runs here rather than at construction so a
+        # run that never logs never creates the directory either.
+        if private_cache_dir() is None:
+            raise OSError("the log directory is not private")
+        fd = os.open(
+            self.baseFilename,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise OSError(f"{self.baseFilename} is not a log file owned by this user")
+            os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            raise
+        return os.fdopen(fd, self.mode, encoding=self.encoding)
+
+
+def _open_log_handler():
+    """The rotating file handler, or None when it cannot be built.
+
+    Failure is deliberately quiet: the handler opens its file on the first
+    record, and an open that fails (no private directory, a symlink on the
+    name, someone else's file) is dropped by the logging module's own error
+    path. A logging failure must never become the failure being logged.
+    """
+    try:
+        handler = _PrivateLogFile(
+            os.path.join(CACHE_DIR, LOG_FILE_NAME),
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUPS,
+            encoding="utf-8",
+            delay=True,
+        )
+    except (OSError, ValueError):
+        return None
+    handler.setFormatter(_LogFormatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    return handler
+
+
+def _log_level_name(setting) -> str:
+    """The user-facing name for a setting, always a valid one.
+
+    SONY_HEADPHONES_LOG is read once at startup; a typo must not silence the
+    log or fail the helper, so anything that is not a known name is `errors`.
+    """
+    name = str(setting).strip().lower() if setting is not None else ""
+    return name if name in LOG_LEVELS else LOG_DEFAULT
+
+
+_LOG_HANDLER = None
+_LOG_LEVEL = LOG_DEFAULT
+
+
+def log_level() -> str:
+    """The level name in effect, for state and the `logging` command."""
+    return _LOG_LEVEL
+
+
+def configure_logging(setting=None) -> str:
+    """Install the local handler once, then only move its level.
+
+    main() calls this at startup with SONY_HEADPHONES_LOG; the daemon calls it
+    again when the level changes over its socket. The first call builds the
+    handler, formatter and logger; every later call is a setLevel on the
+    handler alone, which leaves the file and the format untouched. Returns the
+    level name in effect, so a caller can report what it got.
+    """
+    global _LOG_HANDLER, _LOG_LEVEL
+    _LOG_LEVEL = _log_level_name(
+        os.environ.get("SONY_HEADPHONES_LOG") if setting is None else setting)
+    if _LOG_HANDLER is None:
+        # The import-time NullHandler, and anything else already attached, is
+        # replaced by the file handler; if none can be built a fresh
+        # NullHandler keeps records from reaching the root logger.
+        for existing in list(LOG.handlers):
+            LOG.removeHandler(existing)
+        _LOG_HANDLER = _open_log_handler() or logging.NullHandler()
+        LOG.addHandler(_LOG_HANDLER)
+        # DEBUG on the logger and the level on the handler: the handler is
+        # what moves at runtime, and the fallback carries a level just the
+        # same. Silencing handleError keeps a formatting or rotation failure
+        # out of stderr, which the widget would read as an error message.
+        LOG.setLevel(logging.DEBUG)
+        logging.raiseExceptions = False
+    _LOG_HANDLER.setLevel(LOG_LEVELS[_LOG_LEVEL])
+    return _LOG_LEVEL
+
+
+# ---------------------------------------------------------------------------
 # The RFCOMM link
 # ---------------------------------------------------------------------------
 
@@ -825,8 +1948,149 @@ class NotConnected(Exception):
     pass
 
 
+class Transport:
+    """The bytes-moving half of a Link.
+
+    A Link owns framing, the handshake, dispatch and the parser boundary;
+    where the bytes come from is the transport's business. A transport finds
+    the channel (`open` returns it once the connection is up), moves whole
+    frames in and out, and says when the peer has gone. `recv` raises
+    socket.timeout when the caller's window closes first and NotConnected or
+    OSError when the peer hangs up, so a Link can tell "nothing yet" from
+    "gone"; `connected` is what Link asks before writing.
+
+    `open` optionally takes the caller's `attempt` callback, which is handed
+    each connected candidate before it counts as the channel. An attempt that
+    raises NotConnected, OSError or ProtocolError marks that candidate a dead
+    end, and the transport closes it and tries the next one.
+    """
+
+    sock = None
+
+    @property
+    def connected(self) -> bool:
+        return self.sock is not None
+
+    def open(self, timeout: float, attempt=None) -> int:
+        raise NotImplementedError
+
+    def send(self, frame: bytes) -> None:
+        raise NotImplementedError
+
+    def recv(self, timeout: float) -> bytes:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class RfcommTransport(Transport):
+    """The real radio: SDP discovery, RFCOMM sockets and the bytes between.
+
+    The candidate list is built lazily, in the order it always was: the
+    device's own SDP record decides the channel, the last one that worked is
+    the fallback, and the protocol hint only changes which UUID is searched
+    first. The hint-ordered first UUID is asked straight away; the second is
+    only asked if the first answers nothing, or after the first candidate has
+    been offered and failed. Sockets are opened in that order, and each one is
+    offered to the caller's `attempt` before it counts as the control channel:
+    a candidate the attempt rejects is closed and the next is tried, and the
+    cached channel is forgotten once none of them works.
+    """
+
+    def __init__(self, link: Link):
+        self.link = link
+        self.sock: socket.socket | None = None
+        # Set by Link.connect from the bluetoothctl hint before the search.
+        self.protocol_hint: str | None = None
+
+    def _open_channel(self, channel: int, timeout: float) -> socket.socket:
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+        # BlueZ's RFCOMM refuses a non-blocking connect outright, so connect
+        # blocking (BlueZ applies its own timeout) and only then arm the read
+        # timeout the rest of the conversation runs on.
+        sock.setblocking(True)
+        sock.connect((self.link.address, channel))
+        sock.settimeout(timeout)
+        return sock
+
+    def _candidates(self):
+        """Yield control channels in priority order, querying SDP lazily.
+
+        The second UUID is only queried once the first has been dealt with —
+        a device that answers one UUID and handshakes on it costs one SDP
+        query, not two. The cached channel is a local read and comes last.
+        Duplicates are skipped.
+        """
+        order = (SERVICE_UUID_V2_BYTES, SERVICE_UUID_BYTES)
+        if self.protocol_hint == "v1":
+            order = (SERVICE_UUID_BYTES, SERVICE_UUID_V2_BYTES)
+        seen = set()
+        for uuid in order:
+            discovered = sdp_channel(self.link.address, uuid=uuid)
+            if discovered and discovered not in seen:
+                seen.add(discovered)
+                yield discovered
+        known = cached_channel(self.link.address)
+        if known and known not in seen:
+            seen.add(known)
+            yield known
+
+    def open(self, timeout: float, attempt=None) -> int:
+        last_error = None
+        offered = False
+        for channel in self._candidates():
+            offered = True
+            try:
+                self.sock = self.link._open(channel, timeout)
+            except OSError as exc:
+                last_error = exc
+                continue
+            if attempt is None:
+                return channel
+            try:
+                attempt(channel)
+            except (NotConnected, OSError, ProtocolError) as exc:
+                # The socket connected but the conversation did not: this
+                # candidate is a dead end, so close it and try the next one
+                # before declaring the device unreachable.
+                last_error = exc
+                self.close()
+                continue
+            return channel
+
+        if not offered:
+            raise NotConnected(
+                f"could not find Sony's control service on {self.link.address}; "
+                "is this a Sony device, and is it connected?"
+            )
+        forget_channel(self.link.address)
+        raise NotConnected(
+            f"could not open Sony's control channel on {self.link.address}"
+            + (f": {last_error}" if last_error else "")
+        )
+
+    def send(self, frame: bytes) -> None:
+        self.sock.sendall(frame)
+
+    def recv(self, timeout: float) -> bytes:
+        self.sock.settimeout(timeout)
+        chunk = self.sock.recv(1024)
+        if not chunk:
+            raise NotConnected("the headphones closed the connection")
+        return chunk
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+
 class Link:
-    """One RFCOMM conversation with a pair of headphones.
+    """One conversation with a pair of headphones, over whatever transport.
 
     Sony's protocol is strictly lock-step: every message is answered with an
     ACK carrying the flipped sequence number, and every message the headphones
@@ -835,89 +2099,129 @@ class Link:
     """
 
     ACK_TIMEOUT = 2.0
-    # Real headphones answer a write with a notification some time later; the
-    # stand-in device answers inside write() itself.
+    # A link whose device has its answer queued by the time write returns
+    # needs no settle wait: apply_setting drains once and is done.
     answers_immediately = False
 
-    def __init__(self, address: str, on_change=None):
+    def __init__(self, address: str, on_change=None, transport: Transport | None = None):
         self.address = address
         self.on_change = on_change
         self.state = initial_state()
         self.state["address"] = address
-        self.sock: socket.socket | None = None
+        # "v1" or "v2" once the init handshake has answered; None before that.
+        self.protocol: str | None = None
+        # The command set behind that name: every wire decision goes through
+        # it. v1 is the default until a handshake says otherwise, which is
+        # also what an unconfirmed link used to get.
+        self.adapter: Protocol = V1Protocol()
+        # Where the bytes come from. A real link gets the RFCOMM transport
+        # wired back to this link; the demo passes its stand-in transport in.
+        self.transport = transport if transport is not None else RfcommTransport(self)
         self.seq = 0
         self._buffer = bytearray()
-        self._acked = False
         self.last_rx = 0.0
+
+    # The socket stays reachable under its old name: the daemon selects on it
+    # and the tests stand streams in for it. It lives on the transport.
+    @property
+    def sock(self):
+        return self.transport.sock
+
+    @sock.setter
+    def sock(self, stream) -> None:
+        self.transport.sock = stream
 
     # -- connection ---------------------------------------------------------
 
     def _open(self, channel: int, timeout: float) -> socket.socket:
-        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-        # BlueZ's RFCOMM refuses a non-blocking connect outright, so connect
-        # blocking (BlueZ applies its own timeout) and only then arm the read
-        # timeout the rest of the conversation runs on.
-        sock.setblocking(True)
-        sock.connect((self.address, channel))
-        sock.settimeout(timeout)
-        return sock
+        """Build the socket for one candidate channel.
 
-    def connect(self, timeout: float = 6.0) -> int:
+        The socket itself is the transport's to create; this hook stays on
+        Link because that is where a stand-in stream has always been slipped
+        in, and the transport opens candidates through it.
+        """
+        return self.transport._open_channel(channel, timeout)
+
+    def connect(self, timeout: float = 6.0, protocol: str | None = None) -> int:
         """Open the link and complete the init handshake. Returns the channel.
 
-        The channel comes from the device's own SDP record; the last one that
-        worked is the fallback for the rare case where SDP is briefly
-        unavailable but the channel has not moved.
+        The transport finds and opens the control channel; the v1 and v2
+        control service UUIDs are searched there — the device answers only the
+        one it speaks — with a protocol hint (from `bluetoothctl info`) putting
+        the likely one first and the other only asked if the first falls
+        through. Each candidate is settled by `_establish` before the next is
+        tried, so a channel that connects but does not answer the init
+        handshake falls through rather than failing the whole connect. Any
+        failure that survives every candidate abandons the connection and
+        forgets the cached channel: a cache pointing at a channel that no
+        longer works costs a connect and buys nothing.
         """
-        candidates = []
-        discovered = sdp_channel(self.address)
-        if discovered:
-            candidates.append(discovered)
-        known = cached_channel(self.address)
-        if known and known not in candidates:
-            candidates.append(known)
-
-        if not candidates:
+        self.transport.protocol_hint = protocol
+        try:
+            channel = self.transport.open(timeout, attempt=self._establish)
+            self.state["error"] = None
+            LOG.info("connected on channel %s (%s)", channel, self.protocol)
+            return channel
+        except (NotConnected, OSError, ProtocolError) as exc:
+            # An attempt may have left the link marked connected while it was
+            # in flight; a failed connect is not a connection.
+            self.state["connected"] = False
+            forget_channel(self.address)
+            LOG.error("connect failed: %s", exc)
             raise NotConnected(
-                f"could not find Sony's control service on {self.address}; "
-                "is this a Sony device, and is it connected?"
-            )
+                f"could not open Sony's control channel on {self.address}: {exc}"
+            ) from exc
+        finally:
+            # The successful path returned with the link marked connected;
+            # every other outcome, bug included, leaves no socket behind.
+            if not self.state["connected"]:
+                self.close()
 
-        last_error = None
-        for channel in candidates:
-            try:
-                sock = self._open(channel, timeout)
-            except OSError as exc:
-                last_error = exc
-                continue
+    def _establish(self, channel: int) -> None:
+        """Settle one connected candidate: handshake, features, dialects.
 
-            self.sock = sock
-            self.seq = 0
-            self._buffer.clear()
-            try:
-                if self._handshake():
-                    remember_channel(self.address, channel)
-                    self.state["connected"] = True
-                    self.state["error"] = None
-                    return channel
-                last_error = "the device did not answer the init handshake"
-            except OSError as exc:
-                last_error = exc
-            self.close()
+        This runs before Link.connect has accepted the candidate, so an
+        exception from here (NotConnected, OSError or ProtocolError) is the
+        transport's signal to close this socket and try the next candidate.
+        Sequence and buffer are reset per candidate: a half-finished
+        conversation must not carry into the next socket.
+        """
+        self.seq = 0
+        self._buffer.clear()
+        self.state["connected"] = False
+        if not self._handshake():
+            raise NotConnected("the device did not answer the init handshake")
+        # The confirmed protocol, not the advertised UUID or the bluetoothctl
+        # hint, decides what the device can be offered.
+        self.state["features"] = features_for(self.state.get("name"), self.protocol)
+        # Marking the link connected here, before the dialect queries, matches
+        # the old connect loop: a notification that arrives during negotiation
+        # describes a link that is up.
+        self.state["connected"] = True
+        # The dialect queries are part of opening the link, not an optional
+        # extra: a device that drops during one of them has not given us a
+        # usable connection. A command set with nothing to negotiate makes
+        # this a no-op.
+        self.adapter.negotiate(self)
+        remember_channel(self.address, channel)
 
-        forget_channel(self.address)
-        raise NotConnected(
-            f"could not open Sony's control channel on {self.address}"
-            + (f": {last_error}" if last_error else "")
-        )
+    def _set_protocol(self, protocol: str) -> None:
+        """Adopt the command set the init handshake confirmed.
+
+        The name stays on Link because the state and the QML read it; the
+        adapter is what the wire decisions use from here on.
+        """
+        self.protocol = protocol
+        self.state["protocol"] = protocol
+        self.adapter = V2Protocol() if protocol == "v2" else V1Protocol()
 
     def _handshake(self) -> bool:
         """Send INIT and wait for the device to identify itself.
 
-        A four-byte init reply means protocol v1, which is what this plugin
-        speaks. Eight bytes means v2 (WF-1000XM4, XM5, LinkBuds, CH720N…) —
-        a different command set entirely, so say so rather than send v1 bytes
-        at a device that will ignore them.
+        The init reply's length is the only reliable v1/v2 discriminator: four
+        bytes is v1, eight is v2 (WF-1000XM4, XM5/XM6, LinkBuds, CH720N…).
+        Both command sets are implemented here; the reply picks which one the
+        rest of the conversation uses.
 
         The headphones sometimes ignore the first INIT of a session, usually
         just after a previous one closed, so ask again rather than declaring
@@ -937,23 +2241,17 @@ class Link:
                     continue
                 self._ack(seq)
                 if payload and payload[0] == INIT_REPLY:
-                    if len(payload) == 4:
-                        return True
-                    raise NotConnected(
-                        "this device speaks Sony's v2 protocol, which this plugin "
-                        "does not implement yet (v1 devices only: WH-1000XM2/XM3/XM4)"
-                    )
+                    self._set_protocol("v1" if len(payload) == 4 else "v2")
+                    return True
                 self.dispatch(msg_type, payload)
         return False
 
     def close(self) -> None:
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-        self.sock = None
+        was_connected = self.state.get("connected")
+        self.transport.close()
         self.state["connected"] = False
+        if was_connected:
+            LOG.info("disconnected")
 
     # -- framing ------------------------------------------------------------
 
@@ -971,20 +2269,23 @@ class Link:
                 raw = bytes(self._buffer[start:end + 1]) if start != -1 else None
                 del self._buffer[:end + 1]
                 if raw is None or len(raw) > MAX_MESSAGE_SIZE:
+                    trace("rx", raw or b"", None,
+                          "oversized frame dropped" if raw else "trailer with no header dropped")
                     continue
                 try:
                     message = decode_message(raw)
                 except ProtocolError:
+                    trace("rx", raw, None, "malformed frame dropped")
                     continue
                 self.last_rx = time.monotonic()
+                trace("rx", raw, message)
                 return message
 
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or self.sock is None:
+            if remaining <= 0 or not self.transport.connected:
                 return None
-            self.sock.settimeout(remaining)
             try:
-                chunk = self.sock.recv(1024)
+                chunk = self.transport.recv(remaining)
             except socket.timeout:
                 return None
             except OSError as exc:
@@ -1013,14 +2314,18 @@ class Link:
             del self._buffer[:start]
 
     def _ack(self, their_seq: int) -> None:
-        if self.sock is None:
+        if not self.transport.connected:
             return
-        self.sock.sendall(encode_message(MSG_ACK, 1 - their_seq, b""))
+        frame = encode_message(MSG_ACK, 1 - their_seq, b"")
+        self.transport.send(frame)
+        trace("tx", frame, decode_message(frame))
 
     def write(self, msg_type: int, payload: bytes, wait_ack: bool = True) -> None:
-        if self.sock is None:
+        if not self.transport.connected:
             raise NotConnected("not connected")
-        self.sock.sendall(encode_message(msg_type, self.seq, payload))
+        frame = encode_message(msg_type, self.seq, payload)
+        self.transport.send(frame)
+        trace("tx", frame, decode_message(frame))
         if wait_ack:
             self.wait_for_ack()
 
@@ -1041,7 +2346,32 @@ class Link:
     # -- conversation -------------------------------------------------------
 
     def dispatch(self, msg_type: int, payload: bytes) -> None:
-        if apply_payload(self.state, msg_type, payload) and self.on_change:
+        """Fold one frame into state through the link's adapter.
+
+        A parser ignores what it cannot read, so anything that escapes one is
+        a bug, not device chatter. The daemon above catches only NotConnected
+        and OSError, so an unexpected parser error is traced and dropped here
+        rather than allowed to take the daemon down over one frame.
+        """
+        try:
+            changed = self.adapter.apply(self.state, msg_type, payload)
+        except Exception as exc:
+            trace("rx", b"", None,
+                  f"type={msg_type} payload={payload.hex()} parser error ignored ({exc!r})")
+            LOG.error("parser error ignored: type=%s payload=%s: %s",
+                      msg_type, payload.hex(), exc, exc_info=True)
+            return
+        if changed:
+            self.notify_change()
+
+    def notify_change(self) -> None:
+        """Fan out a state change made outside dispatch.
+
+        `dispatch` is not the only writer: `apply_setting` records a pending
+        write and its outcome directly on the state. Routing that through here
+        keeps one way for the owner to hear about a change.
+        """
+        if self.on_change:
             self.on_change(self.state)
 
     def pump(self, timeout: float) -> None:
@@ -1067,8 +2397,179 @@ class Link:
         self.pump(settle)
 
     def refresh(self) -> dict:
-        self.request(refresh_requests(), settle=0.6)
+        self.request(self.adapter.refresh_requests(self.state), settle=0.6)
         return self.state
+
+    def _select_subtype(self, candidates: tuple[int, ...], getter,
+                        state_key: str, default: int | None) -> int | None:
+        """Ask which dialect of a subtype-keyed family this device answers.
+
+        The candidates are asked in order and the first one whose reply lands
+        in `state_key` wins, so each caller's order decides which dialect is
+        preferred when a device answers more than one. A device that answers
+        none keeps whatever it last reported, falling back to `default`.
+        """
+        for subtype in candidates:
+            self.write(*getter(subtype))
+            self.pump(0.3)
+            if self.state.get(state_key) == subtype:
+                return subtype
+        return self.state.get(state_key) or default
+
+    def select_asc_subtype(self) -> int | None:
+        """Ask which ambient-sound dialect this device answers, and remember it.
+
+        A v2 device that supports noise adaptation (0x19) still answers the
+        older 0x17 parameter out of a dormant slot, so the subtype cannot be
+        guessed from a reply alone: V2_ASC_PROBE_ORDER is the probe order,
+        query subtype first, and the first one that answers wins.
+        """
+        return self._select_subtype(V2_ASC_PROBE_ORDER, v2_asc_get, "asc_subtype", None)
+
+    def select_eq_subtype(self) -> int | None:
+        """Ask which equalizer dialect this device answers, and remember it.
+
+        The WH-1000XM6 answers subtype 0x04 and silently ignores 0x00, but the
+        subtype is asked rather than assumed so XM5-style devices that speak
+        0x00 still work: the candidates are tried in order and the first one
+        that answers wins.
+        """
+        return self._select_subtype(
+            (V2_EQ_SUBTYPE_DEFAULT, 0x00), v2_eq_get, "eq_subtype", V2_EQ_SUBTYPE_DEFAULT)
+
+    def select_bgm_subtype(self) -> int | None:
+        """Ask which background-music dialect this device answers, and remember it.
+
+        The WH-1000XM6 answers subtype 0x09, but some firmware uses 0x03, so the
+        candidates are tried in order and the first one that answers wins. A
+        device that answers neither keeps the default for the next ask.
+        """
+        return self._select_subtype(
+            (V2_AUDIO_SUB_BGM, V2_AUDIO_SUB_BGM_ALT), v2_bgm_get, "bgm_subtype",
+            V2_AUDIO_SUB_BGM)
+
+    def poll_requests(self) -> list[tuple[int, bytes]]:
+        return self.adapter.poll_requests(self.state)
+
+    def power_off(self) -> None:
+        self.adapter.power_off(self)
+
+
+def configure_link(link: Link, device: dict) -> int:
+    """Give a fresh link its device identity and open the handshake.
+
+    The name and the bluetoothctl protocol hint go on the state first, so a
+    failure still describes the right device and offers only its generation's
+    controls. Link.connect replaces the hint with the features of the protocol
+    the handshake confirmed, so the hint never outlives a successful connect.
+    """
+    link.state["name"] = device["name"]
+    link.state["features"] = features_for(device["name"], device.get("protocol"))
+    return link.connect(protocol=device.get("protocol"))
+
+
+# ---------------------------------------------------------------------------
+# Protocol adapters
+# ---------------------------------------------------------------------------
+#
+# v1 and v2 are two command sets over one framing. Link treats that as one
+# seam: it asks its adapter what to send and what a reply meant, and never
+# looks at the protocol name. Each adapter is a thin delegate to the builders
+# and parsers written for its generation — their wire layouts genuinely differ
+# and stay separate — so the seam introduces no second copy of any layout.
+# The adapter is chosen once, by the init handshake, and does not change for
+# the life of the link.
+
+
+class Protocol:
+    """What a Link needs to know about one generation's command set.
+
+    The methods mirror the wire decisions a link makes; the base class
+    exists to name them, and each concrete adapter fills them in.
+    """
+
+    def negotiate(self, link: Link) -> None:
+        """Settle whatever the command set needs before first use, if anything."""
+        raise NotImplementedError
+
+    def refresh_requests(self, state: dict) -> list[tuple[int, bytes]]:
+        """Everything worth asking for after a connect, in display order."""
+        raise NotImplementedError
+
+    def poll_requests(self, state: dict) -> list[tuple[int, bytes]]:
+        """The periodic liveness question, in this generation's dialect."""
+        raise NotImplementedError
+
+    def apply(self, state: dict, msg_type: int, payload: bytes) -> bool:
+        """Fold one reply or notification into state; True if anything moved."""
+        raise NotImplementedError
+
+    def setting_requests(self, state: dict, key: str, value) -> list[tuple[int, bytes]]:
+        """Turn one setting change into the requests that carry it."""
+        raise NotImplementedError
+
+    def power_off(self, link: Link) -> None:
+        """Ask the headphones to turn off, on the command sets that offer it."""
+        raise NotImplementedError
+
+
+class V1Protocol(Protocol):
+    """The v1 ("MDR") command set: WH-1000XM2/XM3/XM4, WF-SP800N…"""
+
+    def negotiate(self, link: Link) -> None:
+        # v1 has no subtype-keyed dialects to discover.
+        return None
+
+    def refresh_requests(self, state: dict) -> list[tuple[int, bytes]]:
+        return refresh_requests()
+
+    def poll_requests(self, state: dict) -> list[tuple[int, bytes]]:
+        return [req(bytes([BATTERY_GET, BATTERY_SINGLE]))]
+
+    def apply(self, state: dict, msg_type: int, payload: bytes) -> bool:
+        return apply_payload(state, msg_type, payload)
+
+    def setting_requests(self, state: dict, key: str, value) -> list[tuple[int, bytes]]:
+        return setting_requests(state, key, value)
+
+    def power_off(self, link: Link) -> None:
+        link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00]))
+
+
+class V2Protocol(Protocol):
+    """The v2 command set: WH-1000XM5/XM6, WF-1000XM5, LinkBuds, CH720N…"""
+
+    def negotiate(self, link: Link) -> None:
+        # v2 reuses opcodes across features and tells them apart by subtype, so
+        # each subtype-keyed family is asked which dialect it answers first.
+        link.select_asc_subtype()
+        link.select_eq_subtype()
+        link.select_bgm_subtype()
+
+    def refresh_requests(self, state: dict) -> list[tuple[int, bytes]]:
+        # Subtype 0x00 is a real equalizer dialect, so it must not be
+        # collapsed by a truthiness fallback; only a missing one defaults.
+        eq_subtype = state.get("eq_subtype")
+        return v2_refresh_requests(
+            state.get("asc_subtype") or V2_ASC_SUBTYPE_QUERY,
+            eq_subtype=V2_EQ_SUBTYPE_DEFAULT if eq_subtype is None else eq_subtype,
+            bgm_subtype=state.get("bgm_subtype") or V2_AUDIO_SUB_BGM,
+        )
+
+    def poll_requests(self, state: dict) -> list[tuple[int, bytes]]:
+        return [
+            req(bytes([V2_BATTERY_GET, V2_BATTERY_SINGLE])),
+            v2_asc_get(state.get("asc_subtype") or V2_ASC_SUBTYPE_QUERY),
+        ]
+
+    def apply(self, state: dict, msg_type: int, payload: bytes) -> bool:
+        return apply_payload_v2(state, msg_type, payload)
+
+    def setting_requests(self, state: dict, key: str, value) -> list[tuple[int, bytes]]:
+        return setting_requests_v2(state, key, value)
+
+    def power_off(self, link: Link) -> None:
+        raise ValueError("turning the headphones off is not supported over v2")
 
 
 # ---------------------------------------------------------------------------
@@ -1086,6 +2587,7 @@ BOOL_SETTINGS = {
 SETTING_KEYS = sorted(list(BOOL_SETTINGS) + [
     "nc", "ambient-level", "focus-on-voice", "eq", "eq-bands", "auto-power-off",
     "stc-sensitivity", "stc-timeout", "stc-focus-on-voice", "voice-notifications",
+    "connection-quality", "listening-mode", "bgm-room-size", "playback-source",
 ])
 
 
@@ -1114,6 +2616,10 @@ SETTING_FEATURES = {
     "eq": "equalizer",
     "eq-bands": "equalizer",
     "dsee": "dsee",
+    "connection-quality": "connection-quality",
+    "playback-source": "multipoint",
+    "listening-mode": "listening-mode",
+    "bgm-room-size": "listening-mode",
     "speak-to-chat": "speak-to-chat",
     "stc-sensitivity": "speak-to-chat",
     "stc-timeout": "speak-to-chat",
@@ -1124,40 +2630,88 @@ SETTING_FEATURES = {
     "auto-power-off": "auto-power-off",
 }
 
+# Setting keys that only exist on one generation. The feature list normally
+# gates them, but a stale or missing list must not let a write cross protocols,
+# so each builder refuses the other side's keys outright.
+V1_ONLY_SETTINGS = {"touch-sensor", "voice-notifications"}
+V2_ONLY_SETTINGS = {"connection-quality", "listening-mode", "bgm-room-size", "playback-source"}
 
-def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
-    """Turn one setting change into the requests that carry it."""
-    features = state.get("features") or sorted(ALL_FEATURES)
+# The fields both builders read before they branch on the key: the resolved
+# feature list and the ambient state they share, plus the v2 discovery fields
+# the v2 builder would otherwise re-read in each arm.
+SettingContext = collections.namedtuple("SettingContext", (
+    "features mode level focus supports_wind asc_subtype asc_auto_ambient "
+    "asc_noise_adapt_sensitivity eq_subtype bgm_subtype"
+))
+
+
+def _setting_context(state: dict, key: str, generation: str,
+                     exclusive: set, ceiling: set) -> SettingContext:
+    """The preamble both settings builders share.
+
+    Refuses the keys in ``exclusive`` (the other generation's set), resolves the
+    feature list (falling back to this generation's ``ceiling``), gates the key
+    through SETTING_FEATURES, and reads the common ambient fields and the v2
+    discovery fields. Each caller supplies its generation, the set it refuses
+    and its own ceiling, so the two are never merged. The generation-specific
+    gates — the v1 auto-power-off timer and the v2 voice-focus refusal — stay
+    with their builder.
+    """
+    other = "v2" if generation == "v1" else "v1"
+    if key in exclusive:
+        raise ValueError(f"{key!r} is a {other} setting and cannot be sent over {generation}")
+    features = state.get("features") or sorted(ceiling)
     needed = SETTING_FEATURES.get(key)
     if needed and needed not in features:
         raise ValueError(f"{state.get('name') or 'this device'} does not support {key}")
-    if key == "auto-power-off" and str(value) not in ("off", "when-taken-off") \
-            and "auto-power-off-timer" not in features:
-        raise ValueError(
-            f"{state.get('name') or 'this device'} only supports auto power off "
-            "'off' or 'when-taken-off'"
-        )
-    supports_wind = state.get("supports_wind")
-    supports_wind = True if supports_wind is None else supports_wind
+
     mode = state.get("nc_mode") or "off"
     level = state.get("ambient_level")
     level = MAX_AMBIENT_LEVEL if level is None else level
     focus = bool(state.get("focus_on_voice"))
+    supports_wind = state.get("supports_wind")
+    supports_wind = True if supports_wind is None else supports_wind
+    eq_subtype = state.get("eq_subtype")
+
+    return SettingContext(
+        features=features,
+        mode=mode,
+        level=level,
+        focus=focus,
+        supports_wind=supports_wind,
+        asc_subtype=state.get("asc_subtype") or V2_ASC_SUBTYPE_QUERY,
+        asc_auto_ambient=0x01 if state.get("asc_auto_ambient") else 0x00,
+        asc_noise_adapt_sensitivity=state.get("asc_noise_adapt_sensitivity") or 0x00,
+        eq_subtype=V2_EQ_SUBTYPE_DEFAULT if eq_subtype is None else eq_subtype,
+        bgm_subtype=state.get("bgm_subtype") or V2_AUDIO_SUB_BGM,
+    )
+
+
+def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
+    """Turn one setting change into the requests that carry it."""
+    ctx = _setting_context(state, key, "v1", V2_ONLY_SETTINGS, V1_FEATURES)
+    if key == "auto-power-off" and str(value) not in ("off", "when-taken-off") \
+            and "auto-power-off-timer" not in ctx.features:
+        raise ValueError(
+            f"{state.get('name') or 'this device'} only supports auto power off "
+            "'off' or 'when-taken-off'"
+        )
 
     if key == "nc":
-        mode = next_nc_mode(mode) if str(value) == "cycle" else str(value)
-        return [asc_request(mode, level, focus, supports_wind)]
+        mode = next_nc_mode(ctx.mode) if str(value) == "cycle" else str(value)
+        return [asc_request(mode, ctx.level, ctx.focus, ctx.supports_wind)]
 
     if key == "ambient-level":
-        level = int(value)
+        level = finite_int(value)
         # Adjusting the slider is how you ask for ambient sound; jumping there
         # matches what the phone app does and avoids a silent no-op in NC mode.
+        mode = ctx.mode
         if mode not in ("ambient-sound", "off"):
             mode = "ambient-sound"
-        return [asc_request(mode, level, focus, supports_wind)]
+        return [asc_request(mode, level, ctx.focus, ctx.supports_wind)]
 
     if key == "focus-on-voice":
-        return [asc_request(mode, level, parse_bool(value, focus), supports_wind)]
+        return [asc_request(ctx.mode, ctx.level, parse_bool(value, ctx.focus), ctx.supports_wind)]
 
     if key == "eq":
         return [eq_preset_request(str(value))]
@@ -1194,30 +2748,240 @@ def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
     raise ValueError(f"unknown setting {key!r}; expected one of {', '.join(SETTING_KEYS)}")
 
 
+def setting_requests_v2(state: dict, key: str, value) -> list[tuple[int, bytes]]:
+    """Turn one setting change into the v2 requests that carry it.
+
+    A read-back of the affected value follows each write: the device announces
+    ambient-sound changes under a subtype that does not carry the whole state,
+    so the authoritative answer is asked for rather than inferred.
+    """
+    ctx = _setting_context(state, key, "v2", V1_ONLY_SETTINGS, V2_FEATURES)
+    if key == "stc-focus-on-voice":
+        # v1-only, but it maps to the shared speak-to-chat feature, so it needs its own refusal.
+        raise ValueError(
+            f"{state.get('name') or 'this device'} does not support voice focus while chatting"
+        )
+
+    if key == "nc":
+        mode = next_nc_mode(ctx.mode) if str(value) == "cycle" else str(value)
+        return [v2_asc_request(mode, ctx.level, ctx.focus, ctx.asc_subtype,
+                               ctx.asc_auto_ambient, ctx.asc_noise_adapt_sensitivity),
+                v2_asc_get(ctx.asc_subtype)]
+
+    if key == "ambient-level":
+        level = finite_int(value)
+        # Adjusting the slider is how you ask for ambient sound, as on v1.
+        mode = ctx.mode
+        if mode not in ("ambient-sound", "off"):
+            mode = "ambient-sound"
+        return [v2_asc_request(mode, level, ctx.focus, ctx.asc_subtype,
+                               ctx.asc_auto_ambient, ctx.asc_noise_adapt_sensitivity),
+                v2_asc_get(ctx.asc_subtype)]
+
+    if key == "focus-on-voice":
+        return [v2_asc_request(ctx.mode, ctx.level, parse_bool(value, ctx.focus),
+                               ctx.asc_subtype, ctx.asc_auto_ambient,
+                               ctx.asc_noise_adapt_sensitivity),
+                v2_asc_get(ctx.asc_subtype)]
+
+    if key == "eq":
+        # 0x00 is a valid XM5-style subtype, so only an unset value defaults.
+        return [v2_eq_preset_request(str(value), ctx.eq_subtype), v2_eq_get(ctx.eq_subtype)]
+
+    if key == "eq-bands":
+        numbers = [int(v) for v in re.split(r"[,\s]+", str(value).strip()) if v]
+        if len(numbers) != V2_EQ_BAND_COUNT:
+            raise ValueError(
+                f"eq-bands takes {V2_EQ_BAND_COUNT} values, each "
+                f"{V2_EQ_BAND_MIN}..{V2_EQ_BAND_MAX}"
+            )
+        return [v2_eq_bands_request(numbers, ctx.eq_subtype), v2_eq_get(ctx.eq_subtype)]
+
+    if key == "auto-power-off":
+        return [v2_auto_power_off_request(str(value)), v2_apo_get()]
+
+    if key in ("stc-sensitivity", "stc-timeout"):
+        sensitivity = state.get("stc_sensitivity") or "auto"
+        timeout = state.get("stc_timeout") or "standard"
+        if key == "stc-sensitivity":
+            sensitivity = str(value)
+        else:
+            timeout = str(value)
+        return [v2_stc_config_request(sensitivity, timeout), v2_stc_get()]
+
+    if key == "speak-to-chat":
+        enabled = parse_bool(value, state.get("speak_to_chat"))
+        return [v2_stc_enabled_request(enabled), v2_system_get(V2_SYSTEM_SUB_SPEAK_TO_CHAT)]
+
+    if key == "pause-when-taken-off":
+        enabled = parse_bool(value, state.get("pause_when_taken_off"))
+        return [v2_bool_request(V2_SYSTEM_SET, V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF, enabled),
+                v2_system_get(V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF)]
+
+    if key == "dsee":
+        enabled = parse_bool(value, state.get("dsee"))
+        return [v2_dsee_request(enabled), v2_dsee_get()]
+
+    if key == "connection-quality":
+        return [v2_connection_quality_request(str(value)), v2_connection_quality_get()]
+
+    if key == "playback-source":
+        # Hand playback to one multipoint peer, then re-read the list so the
+        # reported source is the device's own answer rather than our guess.
+        value = str(value)
+        if not MAC_RE.match(value):
+            raise ValueError(f"invalid Bluetooth address {value!r}")
+        return [v2_source_switch_request(value), v2_device_list_get()]
+
+    if key == "listening-mode":
+        mode = str(value)
+        if mode not in ("standard", "background-music", "cinema"):
+            raise ValueError(
+                f"unknown listening mode {mode!r}; expected one of "
+                "standard, background-music, cinema"
+            )
+        bgm = mode == "background-music"
+        cinema = mode == "cinema"
+        room = state.get("bgm_room_size") or "living-room"
+        return [
+            v2_bgm_request(bgm, room, ctx.bgm_subtype),
+            v2_cinema_request(cinema),
+            v2_bgm_get(ctx.bgm_subtype),
+            v2_cinema_get(),
+        ]
+
+    if key == "bgm-room-size":
+        room = str(value)
+        if room not in V2_BGM_ROOM:
+            raise ValueError(
+                f"unknown room size {room!r}; expected one of {', '.join(V2_BGM_ROOM)}"
+            )
+        enabled = state.get("listening_mode") == "background-music"
+        return [v2_bgm_request(enabled, room, ctx.bgm_subtype), v2_bgm_get(ctx.bgm_subtype)]
+
+    raise ValueError(f"unknown setting {key!r} for this device")
+
+
 SETTLE_TIMEOUT = 2.0
 
 
-def apply_setting(link: Link, key: str, value) -> dict:
-    requests = setting_requests(link.state, key, value)
-    before = dict(link.state)
-    for msg_type, payload in requests:
-        link.write(msg_type, payload)
+def _mark_pending(link: Link, key: str) -> None:
+    """Note that `key` has been written but the device has not confirmed it.
 
-    # The headphones echo every change back as a notification, so wait for the
-    # echo rather than a fixed interval: it usually lands in milliseconds, but
-    # after a burst of writes a WH-1000XM4 can take the better part of a second,
-    # and returning before it arrives reports the old value as the new one.
-    deadline = time.monotonic() + (0 if link.answers_immediately else SETTLE_TIMEOUT)
-    while time.monotonic() < deadline:
-        link.pump(0.15)
+    The clear of any earlier refusal happens here rather than after a move: a
+    new write to the same setting supersedes the last verdict, so the panel
+    stops showing a stale refusal while the fresh read-back is awaited.
+
+    New containers rather than in-place edits: `Daemon.publish` snapshots the
+    state shallowly, so a fan-out already made must not see these fields move
+    under it, or the dedupe would swallow the transition.
+    """
+    pending = list(link.state.get("pending") or [])
+    if key not in pending:
+        pending.append(key)
+    refused = dict(link.state.get("refused") or {})
+    refused.pop(key, None)
+    link.state["pending"] = pending
+    link.state["refused"] = refused
+    link.notify_change()
+
+
+def _settle_pending(link: Link, key: str, reason: str | None = None) -> None:
+    """Drop `key` from pending, recording a refusal reason when there is one."""
+    link.state["pending"] = [
+        name for name in (link.state.get("pending") or []) if name != key
+    ]
+    if reason is not None:
+        refused = dict(link.state.get("refused") or {})
+        refused[key] = reason
+        link.state["refused"] = refused
+    link.notify_change()
+
+
+def apply_setting(link: Link, key: str, value) -> dict:
+    requests = link.adapter.setting_requests(link.state, key, value)
+    # The request list is built (and may refuse the key) before anything is
+    # marked: a setting the builder rejects never claims to be in flight.
+    _mark_pending(link, key)
+    before = dict(link.state)
+    try:
+        for msg_type, payload in requests:
+            link.write(msg_type, payload)
+
+        # The headphones echo every change back as a notification, so wait for the
+        # echo rather than a fixed interval: it usually lands in milliseconds, but
+        # after a burst of writes a WH-1000XM4 can take the better part of a second,
+        # and returning before it arrives reports the old value as the new one.
+        # One drain always happens; a link whose device answered inside the write
+        # has its echo queued already and breaks straight out of the loop.
+        deadline = time.monotonic() + (0 if link.answers_immediately else SETTLE_TIMEOUT)
+        while True:
+            link.pump(0.15)
+            if link.state != before or time.monotonic() >= deadline:
+                break
+
+        # An acknowledgement is not agreement: only a read-back that moved proves
+        # the write landed. `before` already carries the pending entry, so it is
+        # the device's own fields that move here, not our bookkeeping.
         if link.state != before:
-            break
+            _settle_pending(link, key)
+        else:
+            _settle_pending(link, key, f"the headphones did not change {key}")
+    except Exception:
+        # A write or pump that raises after the mark must not leave the key in
+        # pending with no expiry and no settle: drop it (publishing the
+        # transition) and re-raise so the connection/validation error path
+        # still reports the failure. No refusal is recorded — refused is only
+        # for an acknowledged write that did not move within the settle window.
+        _settle_pending(link, key)
+        raise
     return link.state
 
 
 # ---------------------------------------------------------------------------
 # A stand-in for the headphones
 # ---------------------------------------------------------------------------
+
+
+class DemoTransport(Transport):
+    """A transport whose other end is a stand-in device, not a radio.
+
+    Frames go through the real wire format in both directions, so the demo
+    exercises the same encoders the hardware would. A send is answered the way
+    a device answers: an ACK with the flipped sequence, then whatever replies
+    the stand-in produced. The queue is drained by Link's ordinary read loop,
+    which is what keeps the demo from being a second copy of the framing.
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.pending: list[bytes] = []
+
+    @property
+    def connected(self) -> bool:
+        return True
+
+    def open(self, timeout: float = 0.0) -> int:
+        # A stand-in needs no discovery; channel zero stands for the link.
+        return 0
+
+    def send(self, frame: bytes) -> None:
+        msg_type, seq, payload = decode_message(frame)
+        if msg_type == MSG_ACK:
+            # A link acknowledging a frame is not something a stand-in device
+            # answers: it never initiates a frame of its own to be acked.
+            return
+        self.pending.append(encode_message(MSG_ACK, 1 - seq, b""))
+        for reply_type, reply in self.device.respond(msg_type, payload):
+            self.pending.append(encode_message(reply_type, 1 - seq, reply))
+
+    def recv(self, timeout: float) -> bytes:
+        if not self.pending:
+            raise socket.timeout("the stand-in device has nothing more to say")
+        return self.pending.pop(0)
+
+    def close(self) -> None:
+        self.pending.clear()
 
 
 class DemoDevice:
@@ -1245,10 +3009,19 @@ class DemoDevice:
         self.auto_power_off = (0x11, 0x00)
         self.touch_sensor = True
         self.voice_notifications = True
+        # Opt-in no-move mode for the write-then-verify tests: acknowledge a
+        # write and answer with the current value without changing it, the way
+        # a headset does when it discards a write it ACKs. Off by default, so
+        # the ordinary demo and the verify tool still round-trip faithfully.
+        self.stubborn = False
 
     def asc(self) -> bytes:
+        # The level byte only carries meaning in ambient sound; noise cancelling
+        # reports zero, exactly as asc_request writes it. Reporting the stored
+        # level in every mode would invent a reading no real device sends.
+        level = self.level if (not self.nc_on or self.mode == 0x00) else 0x00
         return bytes([ASC_RET, 0x02, 0x01 if self.nc_on else 0x00, 0x02, self.mode,
-                      0x01, 0x01 if self.focus_on_voice else 0x00, self.level])
+                      0x01, 0x01 if self.focus_on_voice else 0x00, level])
 
     def equalizer(self) -> bytes:
         return bytes([EQUALIZER_RET, 0x01, self.eq_preset, 0x06] + self.eq)
@@ -1260,7 +3033,7 @@ class DemoDevice:
         code, sub = payload[0], (payload[1] if len(payload) > 1 else 0)
 
         if msg_type == MSG_COMMAND_2:
-            if code == VOICE_NOTIFICATIONS_SET:
+            if code == VOICE_NOTIFICATIONS_SET and not self.stubborn:
                 self.voice_notifications = payload[3] == 0x01
             if code in (VOICE_NOTIFICATIONS_GET, VOICE_NOTIFICATIONS_SET):
                 return [(MSG_COMMAND_2, bytes([VOICE_NOTIFICATIONS_RET, 0x01, 0x01,
@@ -1279,7 +3052,7 @@ class DemoDevice:
         if code == NC_OPTIMIZER_STATE_GET:
             return [req(bytes([NC_OPTIMIZER_STATE_RET, 0x01, 0x01, 0x01, 0x01, 0x0A]))]
 
-        if code == ASC_SET:
+        if code == ASC_SET and not self.stubborn:
             self.nc_on = payload[2] != 0x00
             self.mode = payload[4]
             self.focus_on_voice = payload[6] == 0x01
@@ -1287,7 +3060,7 @@ class DemoDevice:
         if code in (ASC_GET, ASC_SET):
             return [req(self.asc())]
 
-        if code == EQUALIZER_SET:
+        if code == EQUALIZER_SET and not self.stubborn:
             if payload[2] == 0xFF:
                 self.eq = list(payload[4:10])
                 self.eq_preset = EQ_PRESETS["manual"]
@@ -1296,33 +3069,33 @@ class DemoDevice:
         if code in (EQUALIZER_GET, EQUALIZER_SET):
             return [req(self.equalizer())]
 
-        if code == UPSAMPLING_SET and sub == 0x02:
+        if code == UPSAMPLING_SET and sub == 0x02 and not self.stubborn:
             self.dsee = payload[3] == 0x01
         if code in (UPSAMPLING_GET, UPSAMPLING_SET) and sub == 0x02:
             return [req(bytes([UPSAMPLING_RET, 0x02, 0x00, 0x01 if self.dsee else 0x00]))]
 
         if code in (APO_GET, APO_SET):
             if sub == APO_SUB_SPEAK_TO_CHAT:
-                if code == APO_SET:
+                if code == APO_SET and not self.stubborn:
                     self.speak_to_chat = payload[3] == 0x01
                 return [req(bytes([APO_RET, sub, 0x01, 0x01 if self.speak_to_chat else 0x00]))]
             if sub == APO_SUB_PAUSE_WHEN_TAKEN_OFF:
-                if code == APO_SET:
+                if code == APO_SET and not self.stubborn:
                     self.pause_when_taken_off = payload[3] == 0x01
                 return [req(bytes([APO_RET, sub, 0x00, 0x01 if self.pause_when_taken_off else 0x00]))]
             if sub == APO_SUB_AUTO_POWER_OFF:
-                if code == APO_SET:
+                if code == APO_SET and not self.stubborn:
                     self.auto_power_off = (payload[3], payload[4])
                 return [req(bytes([APO_RET, sub, 0x01, self.auto_power_off[0], self.auto_power_off[1]]))]
             return []
 
-        if code == STC_CONFIG_SET:
+        if code == STC_CONFIG_SET and not self.stubborn:
             self.stc = [payload[3], payload[4], payload[5]]
         if code in (STC_CONFIG_GET, STC_CONFIG_SET):
             return [req(bytes([STC_CONFIG_RET, 0x05, 0x00] + self.stc))]
 
         if code in (TOUCH_GET, TOUCH_SET) and sub == 0xD2:
-            if code == TOUCH_SET:
+            if code == TOUCH_SET and not self.stubborn:
                 self.touch_sensor = payload[3] == 0x01
             return [req(bytes([TOUCH_RET, 0xD2, 0x01, 0x01 if self.touch_sensor else 0x00]))]
 
@@ -1330,34 +3103,280 @@ class DemoDevice:
 
 
 class DemoLink(Link):
-    """A Link whose other end is a DemoDevice instead of a radio."""
+    """A Link whose other end is a DemoDevice instead of a radio.
 
+    It is a plain Link with a DemoTransport and its identity already settled;
+    framing, dispatch and the read loop are the one implementation, not a
+    parallel copy that can drift away from the real one.
+    """
+
+    # The stand-in's transport queues the answer before write returns.
     answers_immediately = True
 
-    def __init__(self, on_change=None):
-        super().__init__("00:00:00:00:00:00", on_change=on_change)
-        self.device = DemoDevice()
+    def __init__(self, on_change=None, device=None):
+        # A caller that dropped and reopened a session passes the same device
+        # back in: a real headset keeps its settings in flash across the gap,
+        # and the demo must answer the same way or `tools/verify.py` could
+        # never see a write survive a release/reclaim.
+        self.device = device if device is not None else DemoDevice()
+        super().__init__("00:00:00:00:00:00", on_change=on_change,
+                         transport=DemoTransport(self.device))
+        self._set_protocol("v1")
         self.state["name"] = "WH-1000XM4 (demo)"
-        self.state["features"] = features_for("WH-1000XM4")
+        self.state["features"] = features_for("WH-1000XM4", "v1")
         self.state["connected"] = True
 
-    def connect(self, timeout: float = 0.0) -> int:
+    def connect(self, timeout: float = 0.0, protocol: str | None = None) -> int:
+        # A stand-in is born connected: __init__ has already set its identity,
+        # protocol and state, and there is no channel to discover.
         return 0
 
-    def close(self) -> None:
-        self.state["connected"] = False
 
-    def write(self, msg_type: int, payload: bytes, wait_ack: bool = True) -> None:
-        # Round-trip through the wire format so the demo exercises the same
-        # framing the real device would, not a shortcut past it.
-        _, _, sent = decode_message(encode_message(msg_type, self.seq, payload))
-        self.seq = 1 - self.seq
-        for reply_type, reply in self.device.respond(msg_type, sent):
-            _, _, received = decode_message(encode_message(reply_type, self.seq, reply))
-            self.dispatch(reply_type, received)
+class DemoDeviceV2:
+    """Answers requests the way a WH-1000XM6 does, without any Bluetooth.
 
-    def pump(self, timeout: float) -> None:
-        return
+    Same role as DemoDevice for the v2 command set: it holds device-side values
+    and replies with real reply payloads, so an encoder and its parser are
+    exercised against each other without hardware.
+    """
+
+    def __init__(self):
+        self.battery = 82
+        self.charging = False
+        self.mode = 2          # 0 off, 1 ambient, 2 noise cancelling
+        self.level = 12
+        self.focus = False
+        self.subtype = V2_ASC_SUBTYPE_NA
+        self.has_wind = False
+        self.auto_ambient = False
+        self.sensitivity = 0x00
+        self.eq_preset = V2_EQ_PRESETS["off"]
+        self.eq_bands = [0] * V2_EQ_BAND_COUNT
+        self.speak_to_chat = False
+        self.pause_when_taken_off = True
+        self.auto_power_off = V2_AUTO_POWER_OFF["when-taken-off"]
+        self.stc = (STC_SENSITIVITY["auto"], STC_TIMEOUT["standard"])
+        # The v2-only surface: DSEE, connection quality, listening mode and
+        # multipoint, none of which have a v1 counterpart to inherit.
+        self.dsee = True
+        self.connection_quality = V2_CONNECTION_QUALITY_SOUND
+        self.bgm_enabled = False
+        self.bgm_room = V2_BGM_ROOM["living-room"]
+        self.cinema_enabled = False
+        self.devices = [
+            {"address": "AA:BB:CC:DD:EE:FF", "name": "Phone", "status": 0x01},
+            {"address": "11:22:33:44:55:66", "name": "Laptop", "status": 0x02},
+        ]
+        self.playback_source = None
+        # Opt-in no-move mode for the write-then-verify tests, off by default;
+        # see DemoDevice.stubborn.
+        self.stubborn = False
+
+    def device_list(self) -> bytes:
+        """The multipoint list, shaped the way parse_v2_device_list reads it.
+
+        Subtype 0x02 puts three class-of-device bytes in each entry, and the
+        trailing byte is the status of whichever peer owns playback, so a
+        status of zero (no peer) leaves none of them flagged.
+        """
+        playback_status = 0x00
+        for device in self.devices:
+            if device["address"] == self.playback_source:
+                playback_status = device["status"]
+        payload = bytearray([V2_PERI_RET, V2_PERI_SUB_DEVICE_LIST, len(self.devices)])
+        for device in self.devices:
+            payload += device["address"].encode("ascii")
+            payload.append(device["status"])
+            payload += b"\x04\x01\x00"
+            name = device["name"].encode("utf-8")
+            payload.append(len(name))
+            payload += name
+        payload.append(playback_status)
+        return bytes(payload)
+
+    def switch_source(self, payload: bytes) -> None:
+        """Flag one known peer as the playback source, ignoring anything else."""
+        if self.stubborn:
+            return
+        if len(payload) < 2 + 17:
+            return
+        try:
+            address = payload[2:19].decode("ascii")
+        except UnicodeDecodeError:
+            return
+        for device in self.devices:
+            if device["address"].lower() == address.lower():
+                self.playback_source = device["address"]
+                return
+
+    def audio_reply(self, code: int, sub: int, payload: bytes) -> list[tuple[int, bytes]]:
+        """One V2_AUDIO_GET/V2_AUDIO_SET, answered under the subtype asked.
+
+        DSEE is plain on/off; connection quality, Upmix Cinema and Background
+        Music are inverted, and Background Music carries the room code. Short
+        or nonsensical writes change nothing and are answered with the current
+        value, the same shrug the parser gives a malformed frame.
+        """
+        if sub == V2_AUDIO_SUB_DSEE:
+            if code == V2_AUDIO_SET and not self.stubborn \
+                    and len(payload) >= 3 and payload[2] in (0x00, 0x01):
+                self.dsee = payload[2] == 0x01
+            return [req(bytes([V2_AUDIO_RET, sub, 0x01 if self.dsee else 0x00]))]
+
+        if sub == V2_AUDIO_SUB_CONNECTION_QUALITY:
+            if code == V2_AUDIO_SET and not self.stubborn \
+                    and len(payload) >= 3 \
+                    and payload[2] in (V2_CONNECTION_QUALITY_SOUND, V2_CONNECTION_QUALITY_STABLE):
+                self.connection_quality = payload[2]
+            return [req(bytes([V2_AUDIO_RET, sub, self.connection_quality]))]
+
+        if sub == V2_AUDIO_SUB_UPMIX_CINEMA:
+            if code == V2_AUDIO_SET and not self.stubborn \
+                    and len(payload) >= 3 and payload[2] in (0x00, 0x01):
+                self.cinema_enabled = payload[2] == 0x00
+            return [req(bytes([V2_AUDIO_RET, sub, 0x00 if self.cinema_enabled else 0x01]))]
+
+        if sub in (V2_AUDIO_SUB_BGM, V2_AUDIO_SUB_BGM_ALT):
+            if code == V2_AUDIO_SET and not self.stubborn \
+                    and len(payload) >= 4 \
+                    and payload[3] in V2_BGM_ROOM_FROM_CODE:
+                self.bgm_enabled = payload[2] == 0x00
+                self.bgm_room = payload[3]
+            # Echo whichever subtype was asked: some firmware answers the room
+            # under 0x03 rather than 0x09, and the read-back follows the
+            # subtype the device chose.
+            return [req(bytes([V2_AUDIO_RET, sub, 0x00 if self.bgm_enabled else 0x01,
+                               self.bgm_room]))]
+
+        return []
+
+    def asc(self) -> bytes:
+        if self.subtype == V2_ASC_SUBTYPE_NA:
+            return bytes([
+                V2_ASC_RET,
+                self.subtype,
+                0x01,
+                0x00 if self.mode == 0 else 0x01,
+                0x01 if self.mode == 1 else 0x00,
+                0x01 if self.focus else 0x00,
+                self.level,
+                0x01 if self.auto_ambient else 0x00,
+                self.sensitivity,
+            ])
+        payload = bytearray([
+            V2_ASC_RET,
+            self.subtype,
+            0x01,
+            0x00 if self.mode == 0 else 0x01,
+            0x01 if self.mode == 1 else 0x00,
+        ])
+        if self.has_wind:
+            payload.append(0x02)
+        payload.append(0x01 if self.focus else 0x00)
+        payload.append(self.level)
+        return bytes(payload)
+
+    def equalizer(self) -> bytes:
+        return bytes(
+            [V2_EQ_RET, V2_EQ_SUBTYPE_DEFAULT, self.eq_preset, V2_EQ_BAND_COUNT]
+            + [b + V2_EQ_BAND_OFFSET for b in self.eq_bands]
+        )
+
+    def respond(self, msg_type: int, payload: bytes) -> list[tuple[int, bytes]]:
+        """One request in, the replies a real device would send back out."""
+        if not payload:
+            return []
+        code, sub = payload[0], (payload[1] if len(payload) > 1 else 0)
+
+        if msg_type == MSG_COMMAND_2:
+            if code == V2_PERI_GET and sub == V2_PERI_SUB_DEVICE_LIST:
+                return [(MSG_COMMAND_2, self.device_list())]
+            if code == V2_PERI_SET_EXTENDED and sub == V2_PERI_SUB_SOURCE_SWITCH:
+                self.switch_source(payload)
+                return []
+            return []
+
+        if code == V2_INIT_REQUEST:
+            return [req(bytes([V2_INIT_REPLY, 0x00, 0x03, 0x00, 0x30, 0x32, 0x00, 0x00]))]
+
+        if code == V2_BATTERY_GET:
+            return [req(bytes([V2_BATTERY_RET, V2_BATTERY_SINGLE, self.battery,
+                               0x01 if self.charging else 0x00]))]
+
+        if code == V2_AUDIO_CODEC_GET:
+            return [req(bytes([V2_AUDIO_CODEC_RET, 0x02, 0x10]))]
+
+        if code == FW_VERSION_REQUEST:
+            version = b"3.0.0"
+            return [req(bytes([FW_VERSION_REPLY, 0x02, len(version)]) + version)]
+
+        if code in (V2_AUDIO_GET, V2_AUDIO_SET):
+            return self.audio_reply(code, sub, payload)
+
+        if code in (V2_ASC_GET, V2_ASC_SET):
+            if code == V2_ASC_SET and not self.stubborn:
+                self.subtype = sub
+                if sub == V2_ASC_SUBTYPE_NA:
+                    self.mode = 0 if payload[3] == 0x00 else (1 if payload[4] == 0x01 else 2)
+                    self.focus = payload[5] == 0x01
+                    self.level = payload[6]
+                    self.auto_ambient = payload[7] == 0x01
+                    self.sensitivity = payload[8]
+                else:
+                    self.has_wind = len(payload) == 8
+                    self.mode = 0 if payload[3] == 0x00 else (1 if payload[4] == 0x01 else 2)
+                    self.focus = payload[-2] == 0x01
+                    self.level = payload[-1]
+            return [req(self.asc())]
+
+        if code == V2_EQ_SET and not self.stubborn:
+            if payload[2] == V2_EQ_PRESETS["custom"]:
+                count = payload[3]
+                self.eq_bands = [payload[4 + i] - V2_EQ_BAND_OFFSET for i in range(count)]
+                self.eq_preset = V2_EQ_PRESETS["custom"]
+            else:
+                self.eq_preset = payload[2]
+        if code in (V2_EQ_GET, V2_EQ_SET):
+            return [req(self.equalizer())]
+
+        if code in (V2_SYSTEM_GET, V2_SYSTEM_SET):
+            if sub == V2_SYSTEM_SUB_SPEAK_TO_CHAT:
+                if code == V2_SYSTEM_SET and not self.stubborn:
+                    self.speak_to_chat = payload[2] == 0x00
+                return [req(bytes([V2_SYSTEM_RET, sub,
+                                   0x00 if self.speak_to_chat else 0x01, 0x01]))]
+            if sub == V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF:
+                if code == V2_SYSTEM_SET and not self.stubborn:
+                    self.pause_when_taken_off = payload[2] == 0x00
+                return [req(bytes([V2_SYSTEM_RET, sub,
+                                   0x00 if self.pause_when_taken_off else 0x01]))]
+            return []
+
+        if code in (V2_APO_GET, V2_APO_SET):
+            if sub == V2_APO_SUB_AUTO_POWER_OFF:
+                if code == V2_APO_SET and not self.stubborn:
+                    self.auto_power_off = payload[2]
+                return [req(bytes([V2_APO_RET, sub, self.auto_power_off, 0x00]))]
+            return []
+
+        if code in (V2_STC_CONFIG_GET, V2_STC_CONFIG_SET):
+            if code == V2_STC_CONFIG_SET and not self.stubborn:
+                self.stc = (payload[2], payload[3])
+            return [req(bytes([V2_STC_CONFIG_RET, V2_STC_CONFIG_SUB, self.stc[0], self.stc[1]]))]
+
+        return []
+
+
+class DemoLinkV2(DemoLink):
+    """A Link whose other end is a v2 stand-in device."""
+
+    def __init__(self, on_change=None, device=None):
+        super().__init__(on_change=on_change)
+        self.device = device if device is not None else DemoDeviceV2()
+        self.transport = DemoTransport(self.device)
+        self._set_protocol("v2")
+        self.state["name"] = "WH-1000XM6 (demo)"
+        self.state["features"] = features_for("WH-1000XM6", "v2")
 
 
 # ---------------------------------------------------------------------------
@@ -1428,18 +3447,62 @@ def socket_path() -> str:
     return os.path.join(runtime_dir(), SOCKET_NAME)
 
 
-def lock_path() -> str:
-    return os.path.join(runtime_dir(), LOCK_NAME)
-
-
 # One JSON line on the control socket. State and requests are a few hundred
 # bytes; this is far above that and still small enough to hold without care.
 MAX_LINE_BYTES = 65536
 
 
-def emit(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
+def emit(payload: dict) -> str:
+    """Write one JSON line to stdout, returning it so a fan-out caller can
+    encode the same bytes rather than serialise a second time."""
+    line = json.dumps(payload) + "\n"
+    sys.stdout.write(line)
     sys.stdout.flush()
+    return line
+
+
+def _command_summary(request: dict) -> str:
+    """One log-sized description of a request, key and value included.
+
+    The daemon and the no-daemon path both log what they were asked, so the
+    summary is built in one place rather than two slightly different ones.
+    """
+    command = str(request.get("cmd", "status"))
+    if command == "set":
+        return f"set {request.get('key')}={request.get('value')}"
+    return command
+
+
+# The control-session policy. `hold` keeps the link open as it always has;
+# `on-demand` closes it after a quiet spell so the phone app over multipoint
+# can take the one control session a Sony headset allows. The widget forwards
+# the settings as environment variables, exactly as SONY_HEADPHONES_LOG does.
+SESSION_POLICIES = ("hold", "on-demand")
+SESSION_POLICY_DEFAULT = "hold"
+SESSION_IDLE_DEFAULT = 30
+# Bound the quiet spell: zero would release between commands and a huge value
+# would never fire, so an out-of-range setting falls back to the default.
+SESSION_IDLE_MIN = 1
+SESSION_IDLE_MAX = 24 * 60 * 60
+
+
+def _env_session_policy() -> str:
+    setting = os.environ.get("SONY_HEADPHONES_SESSION")
+    name = str(setting).strip().lower() if setting is not None else ""
+    return name if name in SESSION_POLICIES else SESSION_POLICY_DEFAULT
+
+
+def _env_session_idle() -> int:
+    setting = os.environ.get("SONY_HEADPHONES_SESSION_IDLE")
+    if setting is None:
+        return SESSION_IDLE_DEFAULT
+    try:
+        seconds = int(str(setting).strip())
+    except (TypeError, ValueError):
+        return SESSION_IDLE_DEFAULT
+    if not SESSION_IDLE_MIN <= seconds <= SESSION_IDLE_MAX:
+        return SESSION_IDLE_DEFAULT
+    return seconds
 
 
 class Daemon:
@@ -1456,8 +3519,16 @@ class Daemon:
     REQUEST_TIMEOUT = 2.0
     RETRY_MIN = 2.0
     RETRY_MAX = 30.0
+    # The web UI is the only intended subscriber, so the cap is generous; it
+    # exists to keep the select() watch list and the fd count bounded. A
+    # subscription past it is refused rather than evicting an existing client:
+    # refusing is simpler and does not surprise a subscriber that was working.
+    MAX_SUBSCRIBERS = 16
+    # Long enough to drain a healthy socket buffer, short enough that one peer
+    # that has stopped reading cannot hold the daemon's only thread for long.
+    SUBSCRIBER_TIMEOUT = 1.0
 
-    def __init__(self, preferred: str | None = None):
+    def __init__(self, preferred: str | None = None, clock=time.monotonic):
         self.preferred = preferred
         self.link: Link | None = None
         self.subscribers: list[socket.socket] = []
@@ -1467,27 +3538,67 @@ class Daemon:
         self.last_emitted: dict | None = None
         self._lock = None
         self._socket_path = None
+        # The injectable clock is for the idle timer and the backoff, so a test
+        # can advance time without sleeping; accept()'s request deadline stays
+        # on real time.
+        self.clock = clock
+        # Read once at startup; a change at runtime goes through `session`.
+        self.session_policy = _env_session_policy()
+        self.session_idle = _env_session_idle()
+        # "connecting" still wants the link, so run() keeps retrying; a
+        # deliberate "released" is undone only by a command or `reclaim`.
+        self.session = "connecting"
+        # The demo stand-in is kept across a release/reclaim so a demo write
+        # survives the session gap the way a real headset's flash does.
+        self.demo_device = None
+        self.last_activity: float | None = None
+        # A released session keeps the last known values so the panel can still
+        # show what the device reported after we hand the transport over.
+        self.released_state: dict | None = None
+        # The most recent values from a live link, kept across lose_link so a
+        # release that arrives after the link died can still hand over the real
+        # device name and battery rather than a blank initial_state().
+        self.last_values: dict | None = None
 
     # -- state out ----------------------------------------------------------
 
     def state(self) -> dict:
         if self.link is not None:
-            return self.link.state
-        disconnected = initial_state()
-        disconnected["address"] = self.preferred
-        return disconnected
+            state = dict(self.link.state)
+        elif self.session == "released" and self.released_state is not None:
+            # A released session is disconnected but not blank: hand back the
+            # values from just before the release.
+            state = dict(self.released_state)
+        else:
+            state = initial_state()
+            state["address"] = self.preferred
+        return self._stamp(state)
+
+    def _stamp(self, state: dict) -> dict:
+        """Overlay the daemon-owned fields on a link or empty state.
+
+        The link was built with whatever log level and policy were in effect
+        then; this process owns the live values, so they are stamped on at the
+        boundary whichever state is about to be reported.
+        """
+        state["logging"] = log_level()
+        state["session"] = self.session
+        state["session_policy"] = self.session_policy
+        state["session_idle"] = self.session_idle
+        return state
 
     def publish(self, state: dict | None = None) -> None:
-        state = dict(state if state is not None else self.state())
+        state = self._stamp(dict(state if state is not None else self.state()))
         if state == self.last_emitted:
             return
         self.last_emitted = state
-        line = json.dumps(state) + "\n"
-        emit(state)
+        encoded = emit(state).encode()
         for client in list(self.subscribers):
             try:
-                client.sendall(line.encode())
-            except OSError:
+                client.settimeout(self.SUBSCRIBER_TIMEOUT)
+                client.sendall(encoded)
+            except (socket.timeout, BlockingIOError, BrokenPipeError, OSError):
+                # One client's failure must not abort the fan-out for the rest.
                 self.drop(client)
 
     def drop(self, client: socket.socket) -> None:
@@ -1501,10 +3612,17 @@ class Daemon:
     # -- device -------------------------------------------------------------
 
     def try_connect(self) -> None:
-        self.next_attempt = time.monotonic() + self.retry_delay
+        self.next_attempt = self.clock() + self.retry_delay
+        self.session = "connecting"
         if demo_mode():
-            self.link = DemoLink(on_change=self.publish)
+            self.link = demo_link(on_change=self.publish, device=self.demo_device)
             self.link.refresh()
+            self.demo_device = getattr(self.link, "device", None)
+            self.session = "held"
+            # A fresh connection counts as activity: an on-demand session that
+            # never receives a command still releases after its quiet spell.
+            self.last_activity = self.clock()
+            LOG.info("connected to %s (demo)", self.link.state.get("name"))
             self.publish()
             return
         device = find_device(self.preferred)
@@ -1513,10 +3631,8 @@ class Daemon:
             return
 
         link = Link(device["address"], on_change=self.publish)
-        link.state["name"] = device["name"]
-        link.state["features"] = features_for(device["name"])
         try:
-            link.connect()
+            configure_link(link, device)
             link.refresh()
         except (NotConnected, OSError) as exc:
             link.close()
@@ -1526,22 +3642,155 @@ class Daemon:
             state["error"] = str(exc)
             self.publish(state)
             self.retry_delay = min(self.RETRY_MAX, self.retry_delay * 2)
+            LOG.info("retrying in %.0f seconds", self.retry_delay)
             return
 
         self.link = link
         self.retry_delay = self.RETRY_MIN
-        self.next_poll = time.monotonic() + self.POLL_INTERVAL
+        self.next_poll = self.clock() + self.POLL_INTERVAL
+        self.session = "held"
+        self.last_activity = self.clock()
         self.publish()
 
     def lose_link(self, reason: str = "") -> None:
         if self.link is not None:
+            # Remember what the live link last reported before it is cleared;
+            # a later deliberate release falls back to it (see Daemon.release).
+            self.last_values = dict(self.link.state)
             self.link.close()
         self.link = None
+        # The link died, it was not handed over: keep wanting it back.
+        self.session = "connecting"
         state = initial_state()
         state["address"] = self.preferred
         state["error"] = reason or None
-        self.next_attempt = time.monotonic() + self.retry_delay
+        self.next_attempt = self.clock() + self.retry_delay
+        LOG.error("link lost: %s", reason or "unknown reason")
         self.publish(state)
+
+    def release(self, reason: str = "") -> None:
+        """Hand the one control session back, deliberately.
+
+        A Sony headset allows exactly one control session at a time, so a
+        phone paired over multipoint cannot take it while we hold the link.
+        Closing the transport returns it; the last known values stay in the
+        state so a released panel still shows what the device reported. This
+        is a hand-off, not a fault, so no error is set — and the cached channel
+        is kept because it is still valid and saves the SDP lookup on reclaim.
+
+        The same path is the one on-demand expiry runs, so a manual release and
+        an idle release can never drift apart.
+        """
+        # `state()` rebuilds a blank initial_state() when there is no live link
+        # and nothing released yet — which is the case when lose_link ran first.
+        # Fall back to the last values the live link reported so the hand-off
+        # still carries the device name and battery.
+        state = dict(self.state())
+        if self.link is None and self.released_state is None and self.last_values is not None:
+            state = dict(self.last_values)
+        if self.link is not None:
+            self.link.close()
+        self.link = None
+        self.session = "released"
+        self.last_activity = None
+        state["connected"] = False
+        state["error"] = None
+        self.released_state = state
+        LOG.info("session released%s", f": {reason}" if reason else "")
+        self.publish(state)
+
+    def reclaim(self) -> None:
+        """Take the control session back and refresh it.
+
+        The existing connect path and its backoff rules apply. An already-held
+        link is a no-op success, so reclaim is safe to call blindly.
+        """
+        if self.link is not None:
+            self.session = "held"
+            # Reclaim is a client command, so it restarts the quiet spell even
+            # when there is nothing to reconnect.
+            self.last_activity = self.clock()
+            return
+        self.session = "connecting"
+        self.try_connect()
+        if self.link is None:
+            raise NotConnected("headphones not connected")
+
+    def release_if_idle(self) -> None:
+        """Release an on-demand session that has been quiet long enough.
+
+        The timer measures client commands that touched the device, not link
+        traffic: the periodic poll and a subscriber reading the state must not
+        keep the session alive, or on-demand would never fire. No thread and no
+        sleep — this is a timestamp comparison the run loop calls on its tick.
+        """
+        if self.session_policy != "on-demand" or self.link is None:
+            return
+        if self.last_activity is None:
+            return
+        if self.clock() - self.last_activity >= self.session_idle:
+            self.release("idle")
+
+    def poll_link(self) -> None:
+        """Ask a live link for its periodic liveness answer, when due.
+
+        Kept apart from run() so the poll can be driven without the loop, and
+        deliberately does not touch last_activity: silence in answer to a
+        question is the only reliable sign a link is gone, so the poll must
+        never double as client activity the idle policy would count.
+        """
+        if self.link is None or demo_mode() or self.clock() < self.next_poll:
+            return
+        self.next_poll = self.clock() + self.POLL_INTERVAL
+        heard = self.link.last_rx
+        try:
+            self.link.request(self.link.poll_requests(), settle=1.0)
+        except (NotConnected, OSError) as exc:
+            self.lose_link(str(exc))
+        else:
+            if self.link is not None and self.link.last_rx == heard:
+                self.lose_link("the headphones stopped answering")
+
+    def set_session(self, request: dict) -> None:
+        """Apply a runtime `session` change, or raise what the command reports.
+
+        The value arrives over the socket, so both the policy name and the
+        idle delay are validated here before they become state (ADR-0004).
+        """
+        value = request.get("value")
+        policy = None
+        if value is not None:
+            policy = str(value).strip().lower()
+            if policy not in SESSION_POLICIES:
+                raise ValueError(
+                    f"unknown session policy {policy!r}; expected one of "
+                    f"{', '.join(SESSION_POLICIES)}"
+                )
+        idle = request.get("idle")
+        seconds = None
+        if idle is not None:
+            # `idle` crosses the socket, so it must be a whole number: JSON's
+            # `true` is a bool (and so an int), and a float would otherwise be
+            # truncated silently. Refuse both rather than guess.
+            if isinstance(idle, bool) or not isinstance(idle, (int, float)):
+                raise ValueError(f"idle seconds must be a whole number, got {idle!r}")
+            if isinstance(idle, float) and not idle.is_integer():
+                raise ValueError(f"idle seconds must be a whole number, got {idle!r}")
+            seconds = int(idle)
+            if not SESSION_IDLE_MIN <= seconds <= SESSION_IDLE_MAX:
+                raise ValueError(
+                    f"idle seconds must be between {SESSION_IDLE_MIN} and {SESSION_IDLE_MAX}"
+                )
+        # Both fields are valid before either lands, so a rejected request
+        # cannot leave half a change behind.
+        if policy is not None:
+            self.session_policy = policy
+        if seconds is not None:
+            self.session_idle = seconds
+        if (policy is not None or seconds is not None) and self.link is not None:
+            # A policy change restarts the quiet spell, so on-demand does not
+            # fire off a timestamp from before it was selected.
+            self.last_activity = self.clock()
 
     # -- clients ------------------------------------------------------------
 
@@ -1550,13 +3799,18 @@ class Daemon:
 
         The headphones drop the control session on their own after a while, and
         nothing says so until the next write, so a command that arrives on a
-        dead link should repair it rather than report failure at the user.
+        dead link should repair it rather than report failure at the user. The
+        same path reclaims a deliberately released session, so the user never
+        has to press reclaim before changing a setting.
         """
         for attempt in (1, 2):
             if self.link is None:
                 self.try_connect()
             if self.link is None:
                 raise NotConnected("headphones not connected")
+            # Only a client command that touches the device feeds the idle
+            # timer; a status answered from cache never reaches this point.
+            self.last_activity = self.clock()
             try:
                 return action(self.link)
             except (NotConnected, OSError) as exc:
@@ -1567,25 +3821,70 @@ class Daemon:
     def handle_command(self, request: dict) -> dict:
         command = str(request.get("cmd", "status"))
 
+        if command == "logging":
+            # The level lives in this process; changing it needs no link, so
+            # it is handled before anything that would open one.
+            value = request.get("value")
+            if value is not None:
+                configure_logging(str(value))
+                LOG.info("logging level set to %s", log_level())
+                self.publish()
+            return {"ok": True, "state": self.state(), "logging": log_level()}
+
         if command in ("status", "ping"):
+            return {"ok": True, "state": self.state()}
+
+        if command == "release":
+            # Manual hand-off of the one control session; see Daemon.release
+            # for why this is not an error.
+            self.release()
+            return {"ok": True, "state": self.state()}
+
+        if command == "reclaim":
+            try:
+                self.reclaim()
+            except (NotConnected, OSError) as exc:
+                LOG.error("command failed: reclaim: %s", exc)
+                return {"ok": False, "error": str(exc), "state": self.state()}
+            LOG.info("command applied: reclaim")
+            return {"ok": True, "state": self.state()}
+
+        if command == "session":
+            try:
+                # A request with neither field is a read: report the policy
+                # the daemon is running without touching the link.
+                if request.get("value") is not None or request.get("idle") is not None:
+                    self.set_session(request)
+                    LOG.info(
+                        "command applied: session %s idle=%s",
+                        self.session_policy, self.session_idle,
+                    )
+                    self.publish()
+            except (ValueError, TypeError, ArithmeticError) as exc:
+                LOG.error("command failed: session: %s", exc)
+                return {"ok": False, "error": str(exc), "state": self.state()}
             return {"ok": True, "state": self.state()}
 
         actions = {
             "set": lambda link: apply_setting(link, str(request.get("key", "")), request.get("value")),
             "cycle": lambda link: apply_setting(link, "nc", "cycle"),
             "refresh": lambda link: link.refresh(),
-            "power-off": lambda link: link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00])),
+            "power-off": lambda link: link.power_off(),
         }
         action = actions.get(command)
         if action is None:
+            LOG.error("unknown command: %s", command)
             return {"ok": False, "error": f"unknown command {command!r}", "state": self.state()}
 
         try:
             self.with_link(action)
-        except ValueError as exc:
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            LOG.error("command failed: %s: %s", _command_summary(request), exc)
             return {"ok": False, "error": str(exc), "state": self.state()}
         except (NotConnected, OSError) as exc:
+            LOG.error("command failed: %s: %s", _command_summary(request), exc)
             return {"ok": False, "error": str(exc), "state": self.state()}
+        LOG.info("command applied: %s", _command_summary(request))
         return {"ok": True, "state": self.state()}
 
     def accept(self, listener: socket.socket) -> None:
@@ -1597,6 +3896,12 @@ class Daemon:
         # whole request: a per-read timeout alone lets a client trickle a byte
         # at a time and hold everything else up for as long as it likes.
         deadline = time.monotonic() + self.REQUEST_TIMEOUT
+        # A read or parse failure that is nobody's command (a timeout, a
+        # truncated line, unparseable bytes) is still dropped without an
+        # answer. Everything after the bytes are in hand goes through the
+        # catch-all: a bad command, an absurd number, a genuinely unexpected
+        # bug, even a RecursionError from a deeply nested parse, all become a
+        # structured refusal, and the daemon carries on to the next client.
         try:
             data = b""
             while b"\n" not in data and len(data) < MAX_LINE_BYTES:
@@ -1609,21 +3914,47 @@ class Daemon:
                     break
                 data += chunk
             request = json.loads(data.decode() or "{}")
+
+            if not isinstance(request, dict):
+                self._reply(client, {
+                    "ok": False,
+                    "error": "the request must be a JSON object",
+                    "state": self.state(),
+                })
+                return
+
+            if str(request.get("cmd", "")) == "subscribe":
+                if len(self.subscribers) >= self.MAX_SUBSCRIBERS:
+                    self._reply(client, {
+                        "ok": False,
+                        "error": "too many subscribers",
+                        "state": self.state(),
+                    })
+                    return
+                try:
+                    client.settimeout(self.SUBSCRIBER_TIMEOUT)
+                    client.sendall((json.dumps(self.state()) + "\n").encode())
+                except OSError:
+                    self.drop(client)
+                    return
+                self.subscribers.append(client)
+                return
+
+            self._reply(client, self.handle_command(request))
         except (OSError, ValueError):
             self.drop(client)
-            return
+        except Exception:
+            # KeyboardInterrupt and SystemExit are deliberately not caught; an
+            # unexpected Exception must not take the daemon down with it.
+            LOG.exception("unhandled error handling a request")
+            self._reply(client, {
+                "ok": False,
+                "error": "the helper failed to handle the request",
+                "state": self.state(),
+            })
 
-        if str(request.get("cmd", "")) == "subscribe":
-            try:
-                client.settimeout(None)
-                client.sendall((json.dumps(self.state()) + "\n").encode())
-            except OSError:
-                self.drop(client)
-                return
-            self.subscribers.append(client)
-            return
-
-        response = self.handle_command(request)
+    def _reply(self, client: socket.socket, response: dict) -> None:
+        """Send one JSON line to a client and hang up."""
         try:
             client.sendall((json.dumps(response) + "\n").encode())
         except OSError:
@@ -1680,17 +4011,25 @@ class Daemon:
 
     def bind_socket(self, dir_fd: int) -> socket.socket:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # Bind through the descriptor for the directory that was just verified,
+        # not through self._socket_path. /proc/self/fd/<dir_fd> resolves to the
+        # inode the descriptor names, so the socket the kernel creates is the
+        # one the mode/owner check covered, even if the path was swapped for a
+        # symlink between the check and the bind. procfs is present on the only
+        # platform this helper runs on, and the path is well under the 108-byte
+        # AF_UNIX limit.
+        bind_path = f"/proc/self/fd/{dir_fd}/{SOCKET_NAME}"
         # umask rather than a chmod afterwards: bind then creates the socket
         # already unreachable to anyone else, with no window in between.
         previous = os.umask(0o177)
         try:
             try:
-                listener.bind(self._socket_path)
+                listener.bind(bind_path)
             except OSError as exc:
                 if exc.errno != errno.EADDRINUSE:
                     raise
                 self.remove_stale_socket(dir_fd)
-                listener.bind(self._socket_path)
+                listener.bind(bind_path)
         finally:
             os.umask(previous)
         return listener
@@ -1717,8 +4056,10 @@ class Daemon:
         listener = self.listen()
         try:
             while True:
-                now = time.monotonic()
-                if self.link is None and now >= self.next_attempt:
+                now = self.clock()
+                # A released session is deliberate: nothing reconnects it until
+                # a client command or `reclaim`, or release would undo itself.
+                if self.link is None and self.session != "released" and now >= self.next_attempt:
                     self.try_connect()
 
                 watched = [listener] + self.subscribers
@@ -1742,19 +4083,11 @@ class Daemon:
                         except (NotConnected, OSError) as exc:
                             self.lose_link(str(exc))
 
-                if self.link is not None and not demo_mode() and time.monotonic() >= self.next_poll:
-                    self.next_poll = time.monotonic() + self.POLL_INTERVAL
-                    heard = self.link.last_rx
-                    try:
-                        self.link.request([req(bytes([BATTERY_GET, BATTERY_SINGLE]))], settle=1.0)
-                    except (NotConnected, OSError) as exc:
-                        self.lose_link(str(exc))
-                    else:
-                        # The socket can stay open long after the headphones
-                        # have stopped listening, so silence in answer to a
-                        # question is the only reliable sign the link is gone.
-                        if self.link is not None and self.link.last_rx == heard:
-                            self.lose_link("the headphones stopped answering")
+                self.poll_link()
+
+                # The idle check rides the one-second tick; the poll and a
+                # subscriber above are link traffic and must not reset it.
+                self.release_if_idle()
         finally:
             if self.link is not None:
                 self.link.close()
@@ -1783,14 +4116,6 @@ def daemon_socket(timeout: float = 5.0) -> socket.socket | None:
     return sock
 
 
-def daemon_alive() -> bool:
-    sock = daemon_socket(timeout=1.0)
-    if sock is None:
-        return False
-    sock.close()
-    return True
-
-
 def ask_daemon(request: dict, timeout: float = 10.0) -> dict | None:
     sock = daemon_socket(timeout)
     if sock is None:
@@ -1817,48 +4142,91 @@ def ask_daemon(request: dict, timeout: float = 10.0) -> dict | None:
         sock.close()
 
 
-def demo_mode() -> bool:
-    return os.environ.get("SONY_HEADPHONES_DEMO", "") not in ("", "0")
+def demo_mode() -> str | None:
+    """Which command set the demo stands in for, or None when demos are off.
+
+    "1" is the original setting and keeps the v1 stand-in; "v2" and "2" ask
+    for the v2 one. Any other truthy value is still a demo, so an old
+    SONY_HEADPHONES_DEMO=true behaves exactly as it always did.
+    """
+    setting = os.environ.get("SONY_HEADPHONES_DEMO", "")
+    if setting in ("", "0"):
+        return None
+    return "v2" if setting in ("v2", "2") else "v1"
+
+
+def demo_link(on_change=None, device=None) -> Link:
+    """A stand-in Link for whichever command set the demo setting names.
+
+    `device` reuses an existing stand-in so its values survive a dropped
+    session, the way a real headset's stored settings do.
+    """
+    if demo_mode() == "v2":
+        return DemoLinkV2(on_change=on_change, device=device)
+    return DemoLink(on_change=on_change, device=device)
+
+
+def apply_command(link: Link, request: dict) -> None:
+    """Carry out one direct request on a link, demo or hardware alike."""
+    command = str(request.get("cmd", "status"))
+    if command == "set":
+        apply_setting(link, str(request.get("key", "")), request.get("value"))
+    elif command == "cycle":
+        apply_setting(link, "nc", "cycle")
+    elif command == "refresh":
+        link.refresh()
+    elif command == "power-off":
+        link.power_off()
 
 
 def direct(request: dict, preferred: str | None) -> dict:
     """Do it ourselves, for when no daemon is running."""
+    if str(request.get("cmd", "")) in ("logging", "release", "reclaim", "session"):
+        # These belong to the daemon's long-running process: the log level and
+        # the session policy live there, and a one-shot helper releases its
+        # link the moment it exits. Say so rather than report a change that
+        # dies with this process, or silently do nothing.
+        state = initial_state()
+        state["address"] = preferred
+        state["error"] = "no sony-headphones daemon is running"
+        return {"ok": False, "error": state["error"], "state": state}
+
+    summary = _command_summary(request)
     if demo_mode():
-        link = DemoLink()
-        link.refresh()
-        command = str(request.get("cmd", "status"))
-        if command == "set":
-            apply_setting(link, str(request.get("key", "")), request.get("value"))
-        elif command == "cycle":
-            apply_setting(link, "nc", "cycle")
-        return {"ok": True, "state": link.state}
+        link = demo_link()
+        try:
+            link.refresh()
+            apply_command(link, request)
+            LOG.info("command applied: %s (demo)", summary)
+            return {"ok": True, "state": link.state}
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            LOG.error("command failed: %s: %s", summary, exc)
+            return {"ok": False, "error": str(exc), "state": dict(link.state)}
 
     device = find_device(preferred)
     if device is None:
         state = initial_state()
         state["address"] = preferred
         state["error"] = "no connected Sony headphones found"
+        LOG.error("command failed: %s: %s", summary, state["error"])
         return {"ok": False, "error": state["error"], "state": state}
 
     link = Link(device["address"])
-    link.state["name"] = device["name"]
-    link.state["features"] = features_for(device["name"])
     try:
-        link.connect()
+        configure_link(link, device)
         link.refresh()
-        command = str(request.get("cmd", "status"))
-        if command == "set":
-            apply_setting(link, str(request.get("key", "")), request.get("value"))
-        elif command == "cycle":
-            apply_setting(link, "nc", "cycle")
-        elif command == "power-off":
-            link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00]))
-        return {"ok": True, "state": link.state}
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc), "state": link.state}
+        apply_command(link, request)
+        LOG.info("command applied: %s", summary)
+        # close() below marks the link disconnected, so hand back a snapshot
+        # taken while it is still live rather than the dict it mutates.
+        return {"ok": True, "state": dict(link.state)}
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        LOG.error("command failed: %s: %s", summary, exc)
+        return {"ok": False, "error": str(exc), "state": dict(link.state)}
     except (NotConnected, OSError) as exc:
-        state = link.state
+        state = dict(link.state)
         state["error"] = str(exc)
+        LOG.error("command failed: %s: %s", summary, exc)
         return {"ok": False, "error": str(exc), "state": state}
     finally:
         link.close()
@@ -1897,8 +4265,14 @@ def describe(state: dict) -> str:
         add("Focus on voice", state.get("focus_on_voice"))
     add("Equalizer", state.get("eq_preset"))
     if state.get("eq_bands") is not None:
-        add("Bands", f"bass {state.get('eq_bass')}, " + " ".join(str(b) for b in state["eq_bands"]))
+        # v1 carries a separate clear-bass band; v2's ten bands stand alone.
+        prefix = "" if state.get("eq_bass") is None else f"bass {state.get('eq_bass')}, "
+        add("Bands", prefix + " ".join(str(b) for b in state["eq_bands"]))
     add("DSEE Extreme", state.get("dsee"))
+    add("Connection quality", state.get("connection_quality"))
+    add("Listening mode", state.get("listening_mode"))
+    if state.get("listening_mode") == "background-music":
+        add("  room", state.get("bgm_room_size"))
     add("Speak-to-Chat", state.get("speak_to_chat"))
     if state.get("speak_to_chat"):
         add("  sensitivity", state.get("stc_sensitivity"))
@@ -1909,6 +4283,18 @@ def describe(state: dict) -> str:
     add("Touch sensor", state.get("touch_sensor"))
     add("Voice guidance", state.get("voice_notifications"))
     add("NC optimizer", state.get("nc_optimizer_pressure") and f"{state['nc_optimizer_pressure']:.1f} atm")
+    devices = state.get("devices")
+    if devices:
+        peers = []
+        for device in devices:
+            if device.get("playback"):
+                status = "playing"
+            elif device.get("connected"):
+                status = "connected"
+            else:
+                status = "disconnected"
+            peers.append(f"{device.get('name')} [{status}]")
+        add("Multipoint", ", ".join(peers))
     return "\n".join(lines)
 
 
@@ -1974,10 +4360,70 @@ def cmd_power_off(args) -> int:
     return _report(run_request({"cmd": "power-off"}, args.address), args)
 
 
+def cmd_release(args) -> int:
+    return _report(run_request({"cmd": "release"}, args.address), args)
+
+
+def cmd_reclaim(args) -> int:
+    return _report(run_request({"cmd": "reclaim"}, args.address), args)
+
+
+def cmd_session(args) -> int:
+    """Show or change the daemon's session policy and idle delay."""
+    request = {"cmd": "session"}
+    if args.value is not None:
+        request["value"] = args.value
+    if args.idle is not None:
+        request["idle"] = args.idle
+    response = run_request(request, args.address)
+    if args.json:
+        emit(_json_state(response))
+    elif response.get("ok"):
+        state = response.get("state", {})
+        print(
+            f"Session: {state.get('session', '?')} "
+            f"({state.get('session_policy', '?')}, idle {state.get('session_idle', '?')}s)"
+        )
+    else:
+        print(response.get("error", "failed"), file=sys.stderr)
+    return 0 if response.get("ok") else 1
+
+
+def _json_state(response: dict) -> dict:
+    """The state to emit for --json, carrying the response's refusal reason.
+
+    The widget reads state.error off every parsed line, so a refusal has to
+    ride in the state even though the response keeps its reason in error.
+    """
+    state = dict(response.get("state", initial_state()))
+    if response.get("error"):
+        state["error"] = response["error"]
+    return state
+
+
+def cmd_logging(args) -> int:
+    """Show or change the log level of the running daemon.
+
+    Without a value the command is a read, which is also the simplest way to
+    ask whether a daemon is there at all.
+    """
+    request = {"cmd": "logging"}
+    if args.level is not None:
+        request["value"] = args.level
+    response = run_request(request, args.address)
+    if args.json:
+        emit(_json_state(response))
+    elif response.get("ok"):
+        print(f"Logging: {response.get('logging', '?')}")
+    else:
+        print(response.get("error", "failed"), file=sys.stderr)
+    return 0 if response.get("ok") else 1
+
+
 def _report(response: dict, args) -> int:
     state = response.get("state", initial_state())
     if args.json:
-        emit(state)
+        emit(_json_state(response))
     elif response.get("ok"):
         print(describe(state))
     else:
@@ -1988,26 +4434,30 @@ def _report(response: dict, args) -> int:
 def cmd_probe(args) -> int:
     """Diagnostics worth pasting into a bug report."""
     print(f"bluetoothctl:      {'found' if bluetoothctl('--version') else 'MISSING'}")
-    devices = connected_devices()
+    # Diagnostics want the machine as it is now, not a two-second-old list:
+    # bypass the cache so a bug report shows a live scan.
+    devices = connected_devices(live=True)
     if not devices:
         print("Sony devices:      none connected")
         print("\nPair and connect the headphones first, then run this again.")
         return 1
     for device in devices:
-        print(f"Sony device:       {device['name']} [{device['address']}]")
+        print(f"Sony device:       {device['name']} [{device['address']}] ({device.get('protocol') or '?'})")
         print(f"  cached channel:  {cached_channel(device['address']) or '-'}")
 
-    device = find_device(args.address) or devices[0]
+    device = next(
+        (d for d in devices if args.address and d["address"].lower() == args.address.lower()),
+        devices[0],
+    )
     link = Link(device["address"])
-    link.state["name"] = device["name"]
-    link.state["features"] = features_for(device["name"])
     started = time.monotonic()
     try:
-        channel = link.connect()
+        channel = configure_link(link, device)
     except (NotConnected, OSError) as exc:
         print(f"  connect:         FAILED ({exc})")
         return 1
-    print(f"  connect:         ok on RFCOMM channel {channel} in {time.monotonic() - started:.2f}s")
+    print(f"  connect:         ok on RFCOMM channel {channel} "
+          f"({link.protocol or '?'}) in {time.monotonic() - started:.2f}s")
     try:
         link.refresh()
         print()
@@ -2020,7 +4470,10 @@ def cmd_probe(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sony-headphones",
-        description="Control Sony headphones (protocol v1: WH-1000XM2/XM3/XM4) over Bluetooth.",
+        description=(
+            "Control Sony headphones over Bluetooth. Speaks protocol v1 "
+            "(WH-1000XM2/XM3/XM4) and v2 (WH-1000XM5/XM6, WF-1000XM5, LinkBuds, CH720N…)."
+        ),
     )
     parser.add_argument("--address", help="Bluetooth MAC to use, if several are connected")
     parser.add_argument("--json", action="store_true", help="print the device state as JSON")
@@ -2031,6 +4484,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("cycle", help="cycle noise cancelling / ambient / off").set_defaults(func=cmd_cycle)
     sub.add_parser("probe", help="diagnose the connection").set_defaults(func=cmd_probe)
     sub.add_parser("power-off", help="turn the headphones off").set_defaults(func=cmd_power_off)
+    sub.add_parser("release", help="release the control session").set_defaults(func=cmd_release)
+    sub.add_parser("reclaim", help="reconnect and hold the control session").set_defaults(func=cmd_reclaim)
+
+    session = sub.add_parser("session", help="show or change the session policy")
+    session.add_argument("value", nargs="?", choices=SESSION_POLICIES,
+                         help="hold or on-demand")
+    session.add_argument("--idle", type=int, metavar="SECONDS",
+                         help="quiet seconds before an on-demand session is released")
+    session.set_defaults(func=cmd_session)
+
+    logger = sub.add_parser("logging", help="show or change the local log level")
+    logger.add_argument("level", nargs="?", choices=tuple(LOG_LEVELS),
+                        help="off, errors or all")
+    logger.set_defaults(func=cmd_logging)
 
     setter = sub.add_parser("set", help="change one setting")
     setter.add_argument("key", choices=SETTING_KEYS, metavar="KEY", help=", ".join(SETTING_KEYS))
@@ -2045,12 +4512,18 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
         args = parser.parse_args(["status", *argv])
+    configure_logging()
     try:
         return args.func(args)
     except BrokenPipeError:
         return 0
     except KeyboardInterrupt:
         return 130
+    except Exception:
+        # An exception this far up is a bug, and it still has to leave a
+        # trail; the re-raise keeps the process's exit behaviour unchanged.
+        LOG.exception("unhandled error")
+        raise
 
 
 if __name__ == "__main__":

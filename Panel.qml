@@ -26,6 +26,21 @@ Panel {
     return !(text === "off" || text === "false" || text === "no" || text === "0")
   }
   readonly property string pinnedAddress: String(setting("address", ""))
+  // The daemon's starting log level. The link at the foot of the panel changes
+  // the running level; this is what a fresh daemon boots with.
+  readonly property string loggingSetting: {
+    var value = String(setting("logging", "errors")).toLowerCase()
+    return Model.LOG_LEVELS.indexOf(value) !== -1 ? value : "errors"
+  }
+  // The daemon's control-session policy and idle delay. A fresh daemon boots
+  // from these; Service pushes a runtime change over the socket.
+  readonly property string sessionPolicy: {
+    var value = String(setting("sessionPolicy", "hold")).toLowerCase()
+    return Model.SESSION_POLICIES.indexOf(value) !== -1 ? value : "hold"
+  }
+  // Clamped to the daemon's bounds so a hand-edited shell.json (0, 200000)
+  // cannot forward a value the daemon refuses.
+  readonly property int idleSeconds: Model.clampSessionIdle(setting("idleSeconds", Model.SESSION_IDLE_DEFAULT))
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -47,6 +62,9 @@ Panel {
     id: sony
     helperPath: root.helperPath
     address: root.pinnedAddress
+    logging: root.loggingSetting
+    sessionPolicy: root.sessionPolicy
+    idleSeconds: root.idleSeconds
     onChanged: root.ensureCursor()
   }
 
@@ -57,29 +75,7 @@ Panel {
   // slider while noise cancelling, the speak-to-chat detail while it is off —
   // are not in the list, so they cannot be landed on.
 
-  readonly property var rows: {
-    if (!sony.connected) return []
-    var list = ["mode"]
-    if (sony.mode === "ambient-sound" || sony.mode === "off") {
-      list.push("level")
-      list.push("focus")
-    }
-    if (supports("equalizer")) list.push("eq")
-    if (supports("dsee")) list.push("dsee")
-    if (supports("speak-to-chat")) {
-      list.push("stc")
-      if (sony.state.speak_to_chat) {
-        list.push("stc-sensitivity")
-        list.push("stc-timeout")
-        list.push("stc-focus")
-      }
-    }
-    if (supports("pause-when-taken-off")) list.push("pause")
-    if (supports("touch-sensor")) list.push("touch")
-    if (supports("voice-notifications")) list.push("voice")
-    if (supports("auto-power-off")) list.push("apo")
-    return list
-  }
+  readonly property var rows: Model.rowsFor(sony.state)
 
   function hasCursorFor(key) {
     return cursorActive && cursorIndex >= 0 && rows[cursorIndex] === key
@@ -129,7 +125,13 @@ Panel {
     } else if (key === "level") {
       sony.setAmbientLevel(sony.ambientLevel + direction)
     } else if (key === "eq") {
-      sony.choose("eq", "eq_preset", stepOption(Model.EQ_PRESETS, sony.state.eq_preset, direction))
+      sony.choose("eq", "eq_preset", stepOption(Model.eqPresets(sony.state.protocol), sony.state.eq_preset, direction))
+    } else if (key === "listening-mode") {
+      sony.choose("listening-mode", "listening_mode", stepOption(Model.LISTENING_MODE, sony.state.listening_mode, direction))
+    } else if (key === "bgm-room-size") {
+      sony.choose("bgm-room-size", "bgm_room_size", stepOption(Model.BGM_ROOM_SIZE, sony.state.bgm_room_size, direction))
+    } else if (key === "connection-quality") {
+      sony.choose("connection-quality", "connection_quality", stepOption(Model.CONNECTION_QUALITY, sony.state.connection_quality, direction))
     } else if (key === "stc-sensitivity") {
       sony.choose("stc-sensitivity", "stc_sensitivity", stepOption(Model.STC_SENSITIVITY, sony.state.stc_sensitivity, direction))
     } else if (key === "stc-timeout") {
@@ -137,6 +139,9 @@ Panel {
     } else if (key === "apo") {
       sony.choose("auto-power-off", "auto_power_off",
                   stepOption(Model.autoPowerOffOptions(root.features), sony.state.auto_power_off, direction))
+    } else if (key === "playback-source") {
+      sony.choose("playback-source", "playback_source",
+                  stepOption(Model.deviceOptions(sony.state), Model.playbackSource(sony.state), direction))
     } else {
       activateRow(key)
     }
@@ -151,6 +156,12 @@ Panel {
     else if (key === "pause") sony.toggle("pause-when-taken-off", "pause_when_taken_off")
     else if (key === "touch") sony.toggle("touch-sensor", "touch_sensor")
     else if (key === "voice") sony.toggle("voice-notifications", "voice_notifications")
+    // Releasing hands the one control session to a phone; reclaiming takes it
+    // back. A connecting session is mid-hand-off, so activation is a no-op.
+    else if (key === "session") {
+      if (sony.session === "released") sony.reclaim()
+      else if (sony.session === "held") sony.release()
+    }
   }
 
   function modeOptions() {
@@ -170,7 +181,9 @@ Panel {
     cursorActive = false
     cursorIndex = 0
     if (panelFlick) panelFlick.contentY = 0
-    sony.refresh()
+    // The watch subscription carries the current state on subscribe and every
+    // change after it, so opening the panel is not a resync point. Middle
+    // click and `r` are the explicit refreshes.
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -184,6 +197,8 @@ Panel {
     function cycle(): string { sony.cycleMode(); return sony.mode }
     function mode(value: string): string { sony.setMode(value); return value }
     function ambient(level: string): string { sony.setAmbientLevel(parseInt(level, 10)); return level }
+    function release(): string { sony.release(); return sony.session }
+    function reclaim(): string { sony.reclaim(); return sony.session }
     function status(): string { return JSON.stringify(sony.state) }
   }
 
@@ -192,9 +207,9 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: Model.barText(sony.state, root.showBattery, root.vertical)
-    slotSize: Style.bar.iconSlot * (root.showBattery && !root.vertical && sony.connected ? 2 : 1)
+    slotSize: Style.bar.iconSlot * (root.showBattery && !root.vertical && sony.showing ? 2 : 1)
     tooltipText: Model.tooltip(sony.state)
-    foreground: sony.connected ? root.barForeground : Qt.darker(root.barForeground, 1.6)
+    foreground: sony.showing ? root.barForeground : Qt.darker(root.barForeground, 1.6)
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) sony.cycleMode()
@@ -203,7 +218,7 @@ Panel {
     }
 
     onWheelMoved: function(delta) {
-      if (!sony.connected) return
+      if (!sony.showing) return
       var wheel = Util.wheelSteps(root.wheelAccumulator, delta)
       root.wheelAccumulator = wheel.remainder
       if (wheel.steps === 0) return
@@ -262,11 +277,11 @@ Panel {
             meta: Model.heroMeta(sony.state)
             foreground: root.foreground
             fontFamily: root.fontFamily
-            iconOpacity: sony.connected ? 1.0 : 0.5
+            iconOpacity: sony.showing ? 1.0 : 0.5
             iconComponent: Component {
               Text {
                 textFormat: Text.PlainText
-                text: Model.modeIcon(sony.mode, sony.connected)
+                text: Model.modeIcon(sony.mode, sony.showing)
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
@@ -276,7 +291,7 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            visible: !sony.connected
+            visible: !sony.showing
             width: parent.width
             text: sony.starting
               ? "Looking for headphones…"
@@ -288,10 +303,40 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          // A control the headphones refused says so instead of silently
+          // snapping back. One quiet line, sized like the caption.
+          Text {
+            textFormat: Text.PlainText
+            visible: sony.showing && sony.lastError !== ""
+            width: parent.width
+            text: sony.lastError
+            color: root.urgent
+            opacity: 0.8
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          // A write the headphones acknowledged without changing: the helper's
+          // own read-back check records one reason per setting, and this line
+          // keeps the association the connection-level error must not carry.
+          // It clears when a later write to the same setting moves the value.
+          Text {
+            textFormat: Text.PlainText
+            visible: sony.showing && Model.refusedSummary(sony.state) !== ""
+            width: parent.width
+            text: Model.refusedSummary(sony.state)
+            color: root.urgent
+            opacity: 0.8
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
           // -- listening ------------------------------------------------
 
           Column {
-            visible: sony.connected
+            visible: sony.showing
             width: parent.width
             spacing: Style.space(8)
 
@@ -322,7 +367,7 @@ Panel {
             }
 
             CursorSurface {
-              visible: sony.mode === "ambient-sound" || sony.mode === "off"
+              visible: Model.hasRow(rows, "level")
               width: parent.width
               hasCursor: root.hasCursorFor("level")
               foreground: root.foreground
@@ -375,7 +420,7 @@ Panel {
             }
 
             ToggleRow {
-              visible: sony.mode === "ambient-sound" || sony.mode === "off"
+              visible: Model.hasRow(rows, "focus")
               rowKey: "focus"
               label: "Focus on voice"
               hint: "Let voices through, filter the rest"
@@ -384,14 +429,14 @@ Panel {
           }
 
           PanelSeparator {
-            visible: sony.connected && (root.supports("equalizer") || root.supports("dsee"))
+            visible: sony.showing && (root.supports("equalizer") || root.supports("listening-mode") || root.supports("dsee") || root.supports("connection-quality"))
             foreground: root.foreground
           }
 
           // -- sound ----------------------------------------------------
 
           Column {
-            visible: sony.connected && (root.supports("equalizer") || root.supports("dsee"))
+            visible: sony.showing && (root.supports("equalizer") || root.supports("listening-mode") || root.supports("dsee") || root.supports("connection-quality"))
             width: parent.width
             spacing: Style.space(8)
 
@@ -403,31 +448,58 @@ Panel {
 
             DropdownRow {
               rowKey: "eq"
-              visible: root.supports("equalizer")
+              visible: Model.hasRow(rows, "eq")
               label: "Equalizer"
-              options: Model.EQ_PRESETS
+              options: Model.eqPresets(sony.state.protocol)
               value: String(sony.state.eq_preset || "off")
               onPicked: function(value) { sony.choose("eq", "eq_preset", value) }
             }
 
+            DropdownRow {
+              rowKey: "listening-mode"
+              visible: Model.hasRow(rows, "listening-mode")
+              label: "Listening mode"
+              options: Model.LISTENING_MODE
+              value: String(sony.state.listening_mode || "standard")
+              onPicked: function(value) { sony.choose("listening-mode", "listening_mode", value) }
+            }
+
+            DropdownRow {
+              rowKey: "bgm-room-size"
+              visible: Model.hasRow(rows, "bgm-room-size")
+              label: "Room"
+              options: Model.BGM_ROOM_SIZE
+              value: String(sony.state.bgm_room_size || "living-room")
+              onPicked: function(value) { sony.choose("bgm-room-size", "bgm_room_size", value) }
+            }
+
             ToggleRow {
               rowKey: "dsee"
-              visible: root.supports("dsee")
+              visible: Model.hasRow(rows, "dsee")
               label: "DSEE Extreme"
               hint: "Upscale compressed audio"
               checked: !!sony.state.dsee
             }
+
+            DropdownRow {
+              rowKey: "connection-quality"
+              visible: Model.hasRow(rows, "connection-quality")
+              label: "Bluetooth quality"
+              options: Model.CONNECTION_QUALITY
+              value: String(sony.state.connection_quality || "sound-quality")
+              onPicked: function(value) { sony.choose("connection-quality", "connection_quality", value) }
+            }
           }
 
           PanelSeparator {
-            visible: sony.connected && root.supports("speak-to-chat")
+            visible: sony.showing && root.supports("speak-to-chat")
             foreground: root.foreground
           }
 
           // -- speak to chat --------------------------------------------
 
           Column {
-            visible: sony.connected && root.supports("speak-to-chat")
+            visible: sony.showing && root.supports("speak-to-chat")
             width: parent.width
             spacing: Style.space(8)
 
@@ -446,7 +518,7 @@ Panel {
 
             DropdownRow {
               rowKey: "stc-sensitivity"
-              visible: !!sony.state.speak_to_chat
+              visible: Model.hasRow(rows, "stc-sensitivity")
               label: "Sensitivity"
               options: Model.STC_SENSITIVITY
               value: String(sony.state.stc_sensitivity || "auto")
@@ -455,7 +527,7 @@ Panel {
 
             DropdownRow {
               rowKey: "stc-timeout"
-              visible: !!sony.state.speak_to_chat
+              visible: Model.hasRow(rows, "stc-timeout")
               label: "Resume after"
               options: Model.STC_TIMEOUT
               value: String(sony.state.stc_timeout || "standard")
@@ -464,23 +536,23 @@ Panel {
 
             ToggleRow {
               rowKey: "stc-focus"
-              visible: !!sony.state.speak_to_chat
+              visible: Model.hasRow(rows, "stc-focus")
               label: "Voice focus while chatting"
               checked: !!sony.state.stc_focus_on_voice
             }
           }
 
           PanelSeparator {
-            visible: sony.connected && (root.supports("pause-when-taken-off") || root.supports("touch-sensor")
-                                        || root.supports("voice-notifications") || root.supports("auto-power-off"))
+            // The session row belongs to the daemon, so this section stays
+            // reachable whenever the headphones are connected.
+            visible: sony.showing
             foreground: root.foreground
           }
 
           // -- behaviour ------------------------------------------------
 
           Column {
-            visible: sony.connected && (root.supports("pause-when-taken-off") || root.supports("touch-sensor")
-                                        || root.supports("voice-notifications") || root.supports("auto-power-off"))
+            visible: sony.showing
             width: parent.width
             spacing: Style.space(8)
 
@@ -492,46 +564,125 @@ Panel {
 
             ToggleRow {
               rowKey: "pause"
-              visible: root.supports("pause-when-taken-off")
+              visible: Model.hasRow(rows, "pause")
               label: "Pause when taken off"
               checked: !!sony.state.pause_when_taken_off
             }
 
             ToggleRow {
               rowKey: "touch"
-              visible: root.supports("touch-sensor")
+              visible: Model.hasRow(rows, "touch")
               label: "Touch controls"
               checked: !!sony.state.touch_sensor
             }
 
             ToggleRow {
               rowKey: "voice"
-              visible: root.supports("voice-notifications")
+              visible: Model.hasRow(rows, "voice")
               label: "Voice guidance"
               checked: !!sony.state.voice_notifications
             }
 
             DropdownRow {
               rowKey: "apo"
-              visible: root.supports("auto-power-off")
+              visible: Model.hasRow(rows, "apo")
               label: "Power off"
               options: Model.autoPowerOffOptions(root.features)
               value: String(sony.state.auto_power_off || "off")
               onPicked: function(value) { sony.choose("auto-power-off", "auto_power_off", value) }
             }
+
+            // The one control session a Sony headset allows: held by the
+            // daemon, or handed to a phone until it is reclaimed. The switch
+            // reads "held" and flips on activation, in either direction.
+            ToggleRow {
+              rowKey: "session"
+              visible: Model.hasRow(rows, "session")
+              label: Model.sessionLabel(sony.state)
+              hint: sony.session === "released"
+                ? "Take the control session back"
+                : "Hand the control session to a phone"
+              checked: sony.session === "held"
+            }
           }
 
-          Text {
-            textFormat: Text.PlainText
-            visible: sony.connected
+          PanelSeparator {
+            visible: sony.showing && root.supports("multipoint") && Model.deviceOptions(sony.state).length > 0
+            foreground: root.foreground
+          }
+
+          // -- multipoint -----------------------------------------------
+
+          Column {
+            visible: sony.showing && root.supports("multipoint") && Model.deviceOptions(sony.state).length > 0
             width: parent.width
-            horizontalAlignment: Text.AlignHCenter
-            text: [sony.state.codec, sony.state.firmware ? "firmware " + sony.state.firmware : ""]
-              .filter(function(part) { return !!part }).join(" · ")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "MULTIPOINT"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            DropdownRow {
+              rowKey: "playback-source"
+              visible: Model.hasRow(rows, "playback-source")
+              label: "Playback source"
+              options: Model.deviceOptions(sony.state)
+              value: String(Model.playbackSource(sony.state))
+              onPicked: function(value) { sony.choose("playback-source", "playback_source", value) }
+            }
+          }
+
+          // The daemon's log level belongs to the daemon, not the headphones,
+          // so this row stays reachable with no device connected; the codec and
+          // firmware caption beside it only says something while one is.
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(6)
+
+            Item { Layout.fillWidth: true }
+
+            Text {
+              id: caption
+              textFormat: Text.PlainText
+              visible: sony.showing
+              text: [sony.state.codec, sony.state.firmware ? "firmware " + sony.state.firmware : ""]
+                .filter(function(part) { return !!part }).join(" · ")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+              Layout.maximumWidth: column.width
+            }
+
+            Text {
+              visible: caption.visible && caption.text !== ""
+              text: "·"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            // The daemon's own log file: click to walk errors → all → off.
+            Text {
+              textFormat: Text.PlainText
+              text: Model.loggingLabel(sony.state.logging)
+              color: loggingLinkMouse.containsMouse ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.underline: loggingLinkMouse.containsMouse
+
+              MouseArea {
+                id: loggingLinkMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: sony.setLogging(Model.nextLogging(sony.state.logging))
+              }
+            }
+
+            Item { Layout.fillWidth: true }
           }
         }
       }
@@ -576,8 +727,8 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: toggleRow.label
-          color: root.foreground
+          text: toggleRow.label + (Model.isPending(sony.state, toggleRow.rowKey) ? " …" : "")
+          color: Model.refusedReason(sony.state, toggleRow.rowKey) !== "" ? root.urgent : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           elide: Text.ElideRight
@@ -637,8 +788,8 @@ Panel {
 
       Text {
         textFormat: Text.PlainText
-        text: dropdownRow.label
-        color: root.foreground
+        text: dropdownRow.label + (Model.isPending(sony.state, dropdownRow.rowKey) ? " …" : "")
+        color: Model.refusedReason(sony.state, dropdownRow.rowKey) !== "" ? root.urgent : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         Layout.alignment: Qt.AlignVCenter
