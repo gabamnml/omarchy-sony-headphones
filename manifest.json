@@ -6,7 +6,7 @@
   "author": "Gabriel Aramburu",
   "license": "AGPL-3.0-or-later",
   "homepage": "https://github.com/gabamnml/omarchy-sony-headphones",
-  "description": "Control Sony WH-1000X headphones from the bar: noise cancelling, ambient sound, equalizer, DSEE Extreme, Bluetooth connection quality, listening mode, multipoint, Speak-to-Chat, battery and more. Speaks both the v1 (WH-1000XM2/XM3/XM4) and v2 (WH-1000XM5/XM6, WF-1000XM5, LinkBuds, CH720N) protocols.",
+  "description": "Control Sony WH-1000X headphones from the bar: noise cancelling, ambient sound, equalizer, DSEE Extreme, Bluetooth connection quality, listening mode, multipoint, Speak-to-Chat, voice guidance, battery and more. Speaks both the v1 (WH-1000XM2/XM3/XM4) and v2 (WH-1000XM5/XM6, WF-1000XM5, LinkBuds, CH720N) protocols.",
   "kinds": [
     "bar-widget"
   ],
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Sony Headphones",
-    "description": "Noise cancelling, ambient sound, equalizer, DSEE Extreme, connection quality, listening mode, multipoint, Speak-to-Chat, pause-when-taken-off, auto power off and battery for Sony WH-1000X headphones, with a control-session toggle for sharing the headset with a phone.",
+    "description": "Noise cancelling, ambient sound, equalizer, DSEE Extreme, connection quality, listening mode, multipoint, Speak-to-Chat, voice guidance, pause-when-taken-off, auto power off and battery for Sony WH-1000X headphones, with a control-session toggle for sharing the headset with a phone.",
     "category": "Hardware",
     "allowMultiple": false,
     "defaultSection": "right",
