@@ -106,7 +106,7 @@ class TestProtocolFeatures(unittest.TestCase):
     """A device is only ever offered its own generation's controls."""
 
     V2_ONLY = {"connection-quality", "listening-mode", "multipoint"}
-    V1_ONLY = {"touch-sensor", "voice-notifications", "speak-to-chat-focus",
+    V1_ONLY = {"touch-sensor", "speak-to-chat-focus",
                "auto-power-off-timer"}
 
     def test_an_unknown_v1_device_gets_the_v1_ceiling(self):
@@ -126,8 +126,12 @@ class TestProtocolFeatures(unittest.TestCase):
     def test_every_model_is_inside_its_protocol_ceiling(self):
         for protocol, ceiling in sonyhp.FEATURE_CEILINGS.items():
             for model, features in sonyhp.FEATURE_SETS[protocol].items():
-                self.assertLessEqual(features, ceiling, model)
-                self.assertLessEqual(set(sonyhp.features_for(model, protocol)), ceiling, model)
+                # Only presentation markers (UI_FEATURES) may sit outside the
+                # wire-command ceiling: they gate a row, not a command.
+                self.assertLessEqual(features - ceiling, sonyhp.UI_FEATURES, model)
+                self.assertLessEqual(
+                    set(sonyhp.features_for(model, protocol)) - ceiling,
+                    sonyhp.UI_FEATURES, model)
 
     def test_the_known_models_keep_their_quirks(self):
         self.assertIn("speak-to-chat-focus", sonyhp.features_for("WH-1000XM4", "v1"))
@@ -137,7 +141,7 @@ class TestProtocolFeatures(unittest.TestCase):
         self.assertIn("auto-power-off-timer", sonyhp.features_for("WH-1000XM3", "v1"))
         self.assertIn("nc-optimizer", sonyhp.features_for("WH-1000XM2", "v1"))
         self.assertIn("multipoint", sonyhp.features_for("WH-1000XM6", "v2"))
-        self.assertNotIn("voice-notifications", sonyhp.features_for("WH-1000XM6", "v2"))
+        self.assertIn("voice-notifications", sonyhp.features_for("WH-1000XM6", "v2"))
 
     def test_initial_state_advertises_nothing_before_a_connect(self):
         self.assertEqual(sonyhp.initial_state()["features"], [])
@@ -233,6 +237,7 @@ class TestSettingProtocols(unittest.TestCase):
         "eq": "clear", "eq-bands": "0,0,0,0,0,0,0,0,0,0", "auto-power-off": "off",
         "stc-sensitivity": "auto", "stc-timeout": "short",
         "speak-to-chat": "on", "pause-when-taken-off": "on", "dsee": "on",
+        "voice-notifications": "on",
         "connection-quality": "stable", "listening-mode": "cinema",
         "bgm-room-size": "cafe", "playback-source": "AA:BB:CC:DD:EE:FF",
     }

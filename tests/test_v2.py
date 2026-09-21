@@ -153,6 +153,16 @@ class TestV2Requests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     sonyhp.v2_source_switch_request(address)
 
+    def test_voice_guidance_get_uses_the_captured_three_byte_shape(self):
+        # The canonical v2 GET is the 2-byte `46 01`, but a WH-1000XM6
+        # (firmware 3.1.5) was captured answering the v1-shaped `46 01 01`,
+        # so the refresh sends the proven shape.
+        requests = sonyhp.v2_refresh_requests()
+        self.assertIn(
+            (sonyhp.MSG_COMMAND_2, bytes([sonyhp.VOICE_NOTIFICATIONS_GET, 0x01, 0x01])),
+            requests,
+        )
+
 
 class TestV2Replies(unittest.TestCase):
     def setUp(self):
@@ -298,6 +308,24 @@ class TestV2Replies(unittest.TestCase):
         self.apply([0xFB, 0x0C, 0x02, 0x03])
         self.assertEqual(self.state["stc_sensitivity"], "low")
         self.assertEqual(self.state["stc_timeout"], "off")
+
+    def test_voice_guidance_reply_is_inverted_with_the_value_at_index_two(self):
+        # Captured on a WH-1000XM6 (firmware 3.1.5): `47 01 00 03` answers
+        # the GET with guidance on. The trailing byte's meaning is unknown.
+        self.assertTrue(self.apply([0x47, 0x01, 0x00, 0x03], sonyhp.MSG_COMMAND_2))
+        self.assertIs(self.state["voice_notifications"], True)
+        self.apply([0x47, 0x01, 0x01, 0x07], sonyhp.MSG_COMMAND_2)
+        self.assertIs(self.state["voice_notifications"], False)
+
+    def test_voice_guidance_notification_is_read_the_same_way(self):
+        self.assertTrue(self.apply([0x49, 0x01, 0x00, 0x01], sonyhp.MSG_COMMAND_2))
+        self.assertIs(self.state["voice_notifications"], True)
+        self.apply([0x49, 0x01, 0x01, 0x01], sonyhp.MSG_COMMAND_2)
+        self.assertIs(self.state["voice_notifications"], False)
+
+    def test_a_short_voice_guidance_reply_is_ignored(self):
+        self.assertFalse(self.apply([0x47, 0x01, 0x00], sonyhp.MSG_COMMAND_2))
+        self.assertIsNone(self.state["voice_notifications"])
 
     def test_garbage_is_ignored(self):
         self.assertFalse(self.apply([0x99, 0x01, 0x02]))
@@ -471,14 +499,34 @@ class TestV2Settings(unittest.TestCase):
         with self.assertRaises(ValueError):
             sonyhp.setting_requests_v2(state, "playback-source", "AA:BB:CC:DD:EE:FF")
 
+    def test_voice_guidance_write_is_three_bytes_and_inverted(self):
+        # v2 SET is `48 01 VV` with 0x00 = on, unlike v1's 4-byte
+        # non-inverted `48 01 01 VV`; the captured 3-byte GET follows so
+        # write-then-verify confirms against the device's own answer.
+        voice_get = (sonyhp.MSG_COMMAND_2,
+                     bytes([sonyhp.VOICE_NOTIFICATIONS_GET, 0x01, 0x01]))
+        on = sonyhp.setting_requests_v2(self.state(), "voice-notifications", "on")
+        self.assertEqual(on, [(sonyhp.MSG_COMMAND_2, bytes([0x48, 0x01, 0x00])),
+                              voice_get])
+        off = sonyhp.setting_requests_v2(self.state(), "voice-notifications", "off")
+        self.assertEqual(off, [(sonyhp.MSG_COMMAND_2, bytes([0x48, 0x01, 0x01])),
+                               voice_get])
+
+    def test_voice_guidance_toggle_reads_the_current_value(self):
+        state = self.state()
+        state["voice_notifications"] = True
+        requests = sonyhp.setting_requests_v2(state, "voice-notifications", "toggle")
+        self.assertEqual(list(requests[0][1]), [0x48, 0x01, 0x01])
+
 
 class TestV2Features(unittest.TestCase):
     def test_the_xm6_gets_its_own_set(self):
         features = sonyhp.features_for("WH-1000XM6")
         for feature in ("battery", "equalizer", "speak-to-chat", "pause-when-taken-off",
-                        "auto-power-off", "dsee", "connection-quality"):
+                        "auto-power-off", "dsee", "connection-quality",
+                        "voice-notifications"):
             self.assertIn(feature, features)
-        for feature in ("touch-sensor", "voice-notifications", "speak-to-chat-focus"):
+        for feature in ("touch-sensor", "speak-to-chat-focus"):
             self.assertNotIn(feature, features)
 
     def test_the_xm6_gets_listening_mode(self):
@@ -487,6 +535,63 @@ class TestV2Features(unittest.TestCase):
 
     def test_the_xm6_gets_multipoint(self):
         self.assertIn("multipoint", sonyhp.features_for("WH-1000XM6"))
+
+    def test_the_xm5_gets_its_own_set_without_listening_mode_or_multipoint(self):
+        features = sonyhp.features_for("WH-1000XM5", "v2")
+        self.assertEqual(set(features), {
+            "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
+            "pause-when-taken-off", "voice-notifications", "auto-power-off",
+        })
+        self.assertNotIn("listening-mode", features)
+        self.assertNotIn("multipoint", features)
+
+    def test_the_wf_xm5_keeps_its_set_without_voice_guidance(self):
+        # Only the WH-1000XM5/XM6 carry voice-notifications on v2 (hardware /
+        # capture evidence); the WF-1000XM5 stays without it.
+        self.assertEqual(set(sonyhp.features_for("WF-1000XM5", "v2")), {
+            "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
+            "pause-when-taken-off", "auto-power-off",
+        })
+
+    def test_a_linkbuds_s_gets_the_linkbuds_s_set(self):
+        # features_for matches by case-insensitive substring in dict order, and
+        # "LinkBuds" is a substring of "LinkBuds S": the longer key must come
+        # first, or every LinkBuds S would resolve to the open-LinkBuds entry.
+        keys = list(sonyhp.FEATURE_SETS["v2"])
+        self.assertLess(keys.index("LinkBuds S"), keys.index("LinkBuds"))
+        expected = {
+            "battery", "equalizer", "dsee", "speak-to-chat",
+            "pause-when-taken-off", "auto-power-off",
+        }
+        self.assertEqual(set(sonyhp.features_for("LinkBuds S", "v2")), expected)
+        self.assertEqual(set(sonyhp.features_for("My LinkBuds S", "v2")), expected)
+        self.assertNotIn("connection-quality",
+                         sonyhp.features_for("LinkBuds S", "v2"))
+
+    def test_the_open_linkbuds_get_their_own_set(self):
+        self.assertEqual(set(sonyhp.features_for("LinkBuds", "v2")), {
+            "battery", "equalizer", "dsee", "speak-to-chat",
+            "pause-when-taken-off", "auto-power-off",
+        })
+
+    def test_voice_guidance_is_offered_only_where_it_is_confirmed(self):
+        # Hardware (WH-1000XM6, firmware 3.1.5) and capture (WH-1000XM5)
+        # evidence; the other v2 models stay without it.
+        self.assertIn("voice-notifications", sonyhp.features_for("WH-1000XM6", "v2"))
+        self.assertIn("voice-notifications", sonyhp.features_for("WH-1000XM5", "v2"))
+        for model in ("LinkBuds", "LinkBuds S", "WH-CH720N", "WF-1000XM5"):
+            with self.subTest(model=model):
+                self.assertNotIn("voice-notifications",
+                                 sonyhp.features_for(model, "v2"))
+
+    def test_the_ch720n_gets_connection_quality_but_no_speak_to_chat(self):
+        self.assertEqual(set(sonyhp.features_for("WH-CH720N", "v2")), {
+            "battery", "equalizer", "dsee", "connection-quality", "auto-power-off",
+        })
+
+    def test_an_unknown_v2_name_still_gets_the_ceiling(self):
+        self.assertEqual(set(sonyhp.features_for("WH-9000 mystery", "v2")),
+                         sonyhp.V2_FEATURES)
 
     def test_v1_speak_to_chat_keeps_voice_focus(self):
         self.assertIn("speak-to-chat-focus", sonyhp.features_for("WH-1000XM4"))

@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Bluetooth
 import Quickshell.Io
+import Quickshell.Services.Mpris
 import "Model.js" as Model
 
 // Owns the conversation with the headphones. The helper's `watch` mode holds
@@ -163,6 +164,26 @@ Item {
     var patch = {}
     patch[stateKey] = value
     set(key, value, patch)
+  }
+
+  // Pause the local media players via MPRIS, so switching the headphones to
+  // another peer does not leave this machine playing to no one. Reads the
+  // players at call time; only players that can pause are asked.
+  function pauseLocalPlayers() {
+    var players = Mpris.players ? Mpris.players.values : []
+    for (var i = 0; i < players.length; i++) {
+      var player = players[i]
+      if (player && player.canPause) player.pause()
+    }
+  }
+
+  // Choosing a playback source is selection-only: while this machine is the
+  // one playing, the reported source names the local source, so picking any
+  // other peer pauses the local players first. A switch the phone makes
+  // arrives as a state line through applyLine and never touches playback.
+  function choosePlaybackSource(value) {
+    if (Model.pausesLocalPlayback(value, Model.playbackSource(state))) pauseLocalPlayers()
+    set("playback-source", value, { playback_source: value })
   }
 
   // The log level lives in the daemon, not the headphones, so this works

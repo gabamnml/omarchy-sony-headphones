@@ -66,4 +66,21 @@ TestCase {
         verify(summary.indexOf("no eq") !== -1, summary)
         compare(Model.refusedSummary({}), "")
     }
+
+    function test_availability_eq_needs_sbc_on_xm2() {
+        var marker = ["battery", "equalizer", "dsee", "nc-optimizer", "eq-sbc-only"]
+        var blocked = Model.availabilityFor({ connected: true, features: marker, codec: "LDAC" }, "eq")
+        verify(!blocked.available)
+        compare(blocked.reason, "Equalizer needs the SBC codec")
+        // Case-insensitive: lowercase ldac blocks too.
+        verify(!Model.availabilityFor({ connected: true, features: marker, codec: "ldac" }, "eq").available)
+        // SBC, an unknown codec, and a missing codec leave the row usable.
+        verify(Model.availabilityFor({ connected: true, features: marker, codec: "SBC" }, "eq").available)
+        verify(Model.availabilityFor({ connected: true, features: marker, codec: "unknown" }, "eq").available)
+        verify(Model.availabilityFor({ connected: true, features: marker }, "eq").available)
+        // No marker (XM4 on LDAC): available. Other rows on a blocked XM2: available.
+        var xm4 = { connected: true, features: ["battery", "equalizer", "dsee"], codec: "LDAC" }
+        verify(Model.availabilityFor(xm4, "eq").available)
+        verify(Model.availabilityFor({ connected: true, features: marker, codec: "LDAC" }, "dsee").available)
+    }
 }

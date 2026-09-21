@@ -271,6 +271,58 @@ class TestPresenceWiring(unittest.TestCase):
         self.assertNotRegex(self.presence_handler(), r"Timer\s*\{")
 
 
+class TestMprisWiring(unittest.TestCase):
+    """Switching the source away pauses playback on this machine, once.
+
+    There is no QML engine here, so Service.qml is read as text, following
+    TestPresenceWiring: enough to catch the MPRIS import going missing, the
+    pause decision moving off the pure Model rule, or a phone-side switch
+    (a state line through applyLine) pausing local playback.
+    """
+
+    def setUp(self):
+        with open(TestShellLaunch.SERVICE, encoding="utf-8") as handle:
+            self.source = handle.read()
+
+    def chooser(self):
+        # The chooser body only, so the other Service.qml text cannot satisfy
+        # the assertions below.
+        return self.source[
+            self.source.index("function choosePlaybackSource"):self.source.index("function refresh")]
+
+    def pauser(self):
+        # The pauser body only, so the chooser's call cannot satisfy the
+        # assertions below.
+        return self.source[
+            self.source.index("function pauseLocalPlayers"):self.source.index("function choosePlaybackSource")]
+
+    def test_the_service_imports_the_mpris_module(self):
+        self.assertRegex(self.source,
+                         r"(?m)^import\s+Quickshell\.Services\.Mpris\s*$")
+
+    def test_the_pause_decision_is_the_pure_model_rule(self):
+        self.assertRegex(self.chooser(), r"Model\s*\.\s*pausesLocalPlayback\s*\(")
+        self.assertRegex(self.chooser(), r"Model\s*\.\s*playbackSource\s*\(\s*state\s*\)")
+
+    def test_the_pause_asks_players_that_can_pause(self):
+        pauser = self.pauser()
+        self.assertRegex(pauser, r"Mpris\s*\.\s*players")
+        self.assertRegex(pauser, r"canPause")
+        self.assertRegex(pauser, r"pause\s*\(\s*\)")
+        # The chooser reaches the pauser through the pure rule, so picking
+        # another peer pauses and re-picking the current one does not.
+        self.assertRegex(self.chooser(), r"pauseLocalPlayers\s*\(\s*\)")
+
+    def test_the_pause_is_selection_only(self):
+        # The pause lives in the chooser the panel calls, so a state line the
+        # phone's switch arrives on never touches local playback.
+        self.assertRegex(self.source, r"function\s+choosePlaybackSource\s*\(")
+        apply = self.source[
+            self.source.index("function applyLine"):self.source.index("onHelperPathChanged")]
+        self.assertNotRegex(apply, r"pause\s*\(\s*\)")
+        self.assertNotRegex(apply, r"pausesLocalPlayback")
+
+
 class TestSessionWiring(PanelSourceMixin, unittest.TestCase):
     """The session policy and manual toggle cross the QML text verbatim.
 
@@ -364,6 +416,38 @@ class TestWriteThenVerifyWiring(PanelSourceMixin, unittest.TestCase):
         self.assertRegex(self.service, r"function\s+pendingPatch\s*\(\s*key\s*\)")
         self.assertRegex(self.service, r"pending\s*\.\s*push\s*\(\s*key\s*\)")
         self.assertRegex(self.service, r"optimistic\s*\(\s*next\s*\)")
+
+
+class TestAvailabilityWiring(PanelSourceMixin, unittest.TestCase):
+    """A blocked setting greys out with a reason instead of hiding.
+
+    There is no QML engine here, so Panel.qml is read as text, following
+    PanelSourceMixin: enough to pin the per-row availability read, the
+    tooltip carrying the reason, the dimmed control and the early-return
+    guard that makes activating a greyed row a no-op.
+    """
+
+    def test_the_rows_read_availability(self):
+        self.assertRegex(self.source,
+                         r"Model\s*\.\s*availabilityFor\s*\(\s*sony\s*\.\s*state\s*,")
+
+    def test_the_blocked_reason_rides_in_a_tooltip(self):
+        self.assertIn("ToolTip.text", self.source)
+        self.assertIn("ToolTip.visible", self.source)
+        self.assertRegex(self.source, r"availability\s*\.\s*reason")
+
+    def test_the_control_dims_while_staying_enabled_otherwise(self):
+        self.assertRegex(self.source, r"enabled:\s*\w+\.available")
+        self.assertRegex(self.source, r"opacity:\s*\w+\.available\s*\?\s*1\.0\s*:\s*0\.5")
+
+    def test_activating_a_greyed_row_is_a_no_op(self):
+        # The click/pick handlers bail before any write, and the shared
+        # keyboard paths (activateRow, adjustCursorRow) do the same.
+        self.assertRegex(self.source, r"if\s*\(\s*!\w+\.available\s*\)\s*return")
+        self.assertRegex(
+            self.source,
+            r"if\s*\(\s*!Model\s*\.\s*availabilityFor\s*\(\s*sony\s*\.\s*state\s*,"
+            r"\s*\w+\s*\)\s*\.\s*available\s*\)\s*return")
 
 
 class TestDirectRefresh(unittest.TestCase):

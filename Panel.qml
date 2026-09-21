@@ -119,6 +119,9 @@ Panel {
   // ambient level by one step, a dropdown to its neighbouring option.
   function adjustCursorRow(direction) {
     var key = rows[cursorIndex]
+    // A greyed row stays put under the cursor: nudging it is a no-op, so no
+    // write leaves for the helper and nothing lands in pending.
+    if (!Model.availabilityFor(sony.state, key).available) return
     if (key === "mode") {
       var modes = root.modeOptions()
       sony.setMode(stepOption(modes, sony.mode, direction))
@@ -148,6 +151,8 @@ Panel {
   }
 
   function activateRow(key) {
+    // Activating a greyed row is a no-op: no write, no pending.
+    if (!Model.availabilityFor(sony.state, key).available) return
     if (key === "mode") sony.cycleMode()
     else if (key === "focus") sony.toggle("focus-on-voice", "focus_on_voice")
     else if (key === "dsee") sony.toggle("dsee", "dsee")
@@ -630,7 +635,7 @@ Panel {
               label: "Playback source"
               options: Model.deviceOptions(sony.state)
               value: String(Model.playbackSource(sony.state))
-              onPicked: function(value) { sony.choose("playback-source", "playback_source", value) }
+              onPicked: function(value) { sony.choosePlaybackSource(value) }
             }
           }
 
@@ -697,18 +702,30 @@ Panel {
     property string label: ""
     property string hint: ""
     property bool checked: false
+    // A row the model lacks stays hidden (rowsFor); a row that exists but is
+    // blocked by another setting is shown with its control greyed, the label
+    // at full contrast, and the reason in a tooltip — no persistent line.
+    readonly property var availability: Model.availabilityFor(sony.state, rowKey)
+    readonly property bool available: availability.available
 
     width: column.width
     hasCursor: root.hasCursorFor(rowKey)
     foreground: root.foreground
     implicitHeight: toggleContent.implicitHeight + Style.spacing.rowPaddingX
 
+    ToolTip.text: toggleRow.availability.reason
+    ToolTip.visible: !toggleRow.available && rowMouse.containsMouse
+
     MouseArea {
+      id: rowMouse
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
+      cursorShape: toggleRow.available ? Qt.PointingHandCursor : Qt.ArrowCursor
       onEntered: root.setCursor(toggleRow.rowKey)
-      onClicked: root.activateRow(toggleRow.rowKey)
+      onClicked: {
+        if (!toggleRow.available) return
+        root.activateRow(toggleRow.rowKey)
+      }
     }
 
     RowLayout {
@@ -751,8 +768,13 @@ Panel {
         busy: sony.busy
         hasCursor: toggleRow.hasCursor
         foreground: root.foreground
+        enabled: toggleRow.available
+        opacity: toggleRow.available ? 1.0 : 0.5
         Layout.alignment: Qt.AlignVCenter
-        onToggled: root.activateRow(toggleRow.rowKey)
+        onToggled: {
+          if (!toggleRow.available) return
+          root.activateRow(toggleRow.rowKey)
+        }
         onHovered: function(on) { if (on) root.setCursor(toggleRow.rowKey) }
       }
     }
@@ -765,13 +787,21 @@ Panel {
     property var options: []
     property string value: ""
     signal picked(string value)
+    // Same availability contract as ToggleRow: the label stays at full
+    // contrast, only the control dims, and the reason rides in a tooltip.
+    readonly property var availability: Model.availabilityFor(sony.state, rowKey)
+    readonly property bool available: availability.available
 
     width: column.width
     hasCursor: root.hasCursorFor(rowKey)
     foreground: root.foreground
     implicitHeight: Style.spacing.controlHeight + Style.spacing.rowPaddingX
 
+    ToolTip.text: dropdownRow.availability.reason
+    ToolTip.visible: !dropdownRow.available && dropdownMouse.containsMouse
+
     MouseArea {
+      id: dropdownMouse
       anchors.fill: parent
       hoverEnabled: true
       acceptedButtons: Qt.NoButton
@@ -805,7 +835,12 @@ Panel {
         value: dropdownRow.value
         fontFamily: root.fontFamily
         hasCursor: dropdownRow.hasCursor
-        onChanged: function(value) { dropdownRow.picked(value) }
+        enabled: dropdownRow.available
+        opacity: dropdownRow.available ? 1.0 : 0.5
+        onChanged: function(value) {
+          if (!dropdownRow.available) return
+          dropdownRow.picked(value)
+        }
         onHovered: function(on) { if (on) root.setCursor(dropdownRow.rowKey) }
       }
     }

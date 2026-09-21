@@ -7,6 +7,7 @@ bluetoothctl invocation and the publish fan-out.
 """
 
 import contextlib
+import errno
 import io
 import json
 import logging
@@ -516,6 +517,9 @@ class DemoDaemonMixin(LoggingResetMixin):
     mixin rather than two copies of the same connect/answer pair.
     """
 
+    # Which demo command set the stand-in speaks; a v2 test overrides it.
+    DEMO = "1"
+
     def setUp(self):
         self.clock = FakeClock()
         self.daemon = sonyhp.Daemon(clock=self.clock)
@@ -529,7 +533,7 @@ class DemoDaemonMixin(LoggingResetMixin):
         self.reset_logging()
 
     def connect(self):
-        with mock.patch.dict(os.environ, {"SONY_HEADPHONES_DEMO": "1"}), \
+        with mock.patch.dict(os.environ, {"SONY_HEADPHONES_DEMO": self.DEMO}), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.daemon.try_connect()
 
@@ -539,7 +543,7 @@ class DemoDaemonMixin(LoggingResetMixin):
         client.sendall = sent.append
         listener = mock.Mock()
         listener.accept.return_value = (client, None)
-        with mock.patch.dict(os.environ, {"SONY_HEADPHONES_DEMO": "1"}), \
+        with mock.patch.dict(os.environ, {"SONY_HEADPHONES_DEMO": self.DEMO}), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.daemon.accept(listener)
         self.assertTrue(client.closed)
@@ -844,6 +848,177 @@ class TestWriteThenVerify(DemoDaemonMixin, unittest.TestCase):
         self.assertEqual(payload["pending"], [])
         self.assertEqual(payload["refused"],
                          {"dsee": "the headphones did not change dsee"})
+
+
+class TestBackgroundMusicResetGuard(DemoDaemonMixin, unittest.TestCase):
+    """A link lost on a Background-music write is explained, not left bare.
+
+    A digital assistant makes the device refuse Background music — Sound
+    Connect greys the setting out and a write makes the headphones reset. No
+    record the helper reads carries that flag, so the only signal is the link
+    dying on the write; the daemon turns that into a refused row with a reason
+    instead of a bare connection error. Every run stays on the demo transport.
+    """
+
+    DEMO = "v2"
+
+    def setUp(self):
+        super().setUp()
+        # Background music and listening mode are v2-only, so the stand-in has
+        # to be the XM6 one for a write to reach the wire at all.
+        self.daemon.demo_device = sonyhp.DemoDeviceV2()
+
+    def dead_on_write(self, link):
+        def boom(*_args, **_kwargs):
+            raise OSError("the headphones reset")
+        link.write = boom
+
+    def lose_after(self, key, value):
+        self.connect()
+        self.dead_on_write(self.daemon.link)
+        with self.assertRaises(OSError):
+            sonyhp.apply_setting(self.daemon.link, key, value)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.daemon.lose_link("the headphones reset")
+        return self.daemon.state()
+
+    def test_a_lost_link_on_a_bgm_write_carries_the_reason(self):
+        state = self.lose_after("bgm-room-size", "cafe")
+        self.assertIn("bgm-room-size", state["refused"])
+        self.assertIn("digital assistant", state["refused"]["bgm-room-size"])
+
+    def test_listening_mode_is_guarded_too(self):
+        state = self.lose_after("listening-mode", "background-music")
+        self.assertIn("listening-mode", state["refused"])
+
+    def test_a_lost_link_on_another_setting_is_not_blamed_on_the_assistant(self):
+        self.connect()
+        self.dead_on_write(self.daemon.link)
+        with self.assertRaises(OSError):
+            sonyhp.apply_setting(self.daemon.link, "dsee", "off")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.daemon.lose_link("the headphones reset")
+        self.assertEqual(self.daemon.state()["refused"], {})
+
+    def test_a_fresh_attempt_clears_the_explanation(self):
+        state = self.lose_after("bgm-room-size", "cafe")
+        self.assertIn("bgm-room-size", state["refused"])
+        response = self.answer({"cmd": "set", "key": "bgm-room-size", "value": "cafe"})
+        self.assertEqual(response["state"]["refused"], {})
+        self.assertEqual(response["state"]["pending"], [])
+
+
+class TestReconnectBackoff(DemoDaemonMixin, unittest.TestCase):
+    """A link that dies young means a fight for the session: back off.
+
+    A Sony headset holds one control session, so a link that dies before it
+    ever proved itself means something else — a phone on multipoint — is
+    taking it back. The retry delay must grow instead of resetting, until a
+    link holds long enough to count as stable. Every run stays on the demo
+    transport with a fake clock, so no test waits.
+    """
+
+    def lose(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.daemon.lose_link("dropped")
+
+    def test_a_link_that_dies_young_grows_the_retry_delay(self):
+        self.connect()
+        self.clock.now += 0.1
+        self.lose()
+        self.assertGreater(self.daemon.retry_delay, sonyhp.Daemon.RETRY_MIN)
+
+    def test_repeated_immediate_deaths_double_up_to_the_maximum(self):
+        self.connect()
+        delays = []
+        for _ in range(6):
+            self.lose()
+            delays.append(self.daemon.retry_delay)
+            self.connect()
+        expected = []
+        delay = sonyhp.Daemon.RETRY_MIN
+        for _ in range(6):
+            delay = min(sonyhp.Daemon.RETRY_MAX, delay * 2)
+            expected.append(delay)
+        self.assertEqual(delays, expected)
+
+    def test_a_link_that_held_resets_the_retry_delay(self):
+        self.connect()
+        self.clock.now += 0.1
+        self.lose()
+        self.assertGreater(self.daemon.retry_delay, sonyhp.Daemon.RETRY_MIN)
+        self.connect()
+        self.clock.now += sonyhp.Daemon.STABLE_AFTER
+        self.lose()
+        self.assertEqual(self.daemon.retry_delay, sonyhp.Daemon.RETRY_MIN)
+
+    def test_a_young_death_schedules_the_next_attempt_off_the_grown_delay(self):
+        self.connect()
+        self.clock.now += 0.1
+        self.lose()
+        self.assertEqual(self.daemon.next_attempt,
+                         self.clock() + self.daemon.retry_delay)
+
+    def test_a_deliberate_release_resets_the_retry_delay(self):
+        self.connect()
+        self.clock.now += 0.1
+        self.lose()
+        self.assertGreater(self.daemon.retry_delay, sonyhp.Daemon.RETRY_MIN)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.daemon.release("hand-off")
+        self.assertEqual(self.daemon.retry_delay, sonyhp.Daemon.RETRY_MIN)
+
+
+class TestControlChannelBusy(unittest.TestCase):
+    """EBUSY names the fight instead of reading as a dead device.
+
+    One control session only: when a phone holds it over multipoint, the
+    RFCOMM open fails busy. The transport reports that plainly, still typed
+    NotConnected, rather than burning through candidates into a generic
+    could-not-open.
+    """
+
+    def test_ebusy_reports_the_other_device_plainly(self):
+        link = sonyhp.Link("AA:BB:CC:DD:EE:FF")
+        busy = OSError(errno.EBUSY, "Device or resource busy")
+        with mock.patch.object(link.transport, "_open_channel", side_effect=busy), \
+                mock.patch.object(sonyhp, "sdp_channel", return_value=7), \
+                mock.patch.object(sonyhp, "cached_channel", return_value=None):
+            with self.assertRaises(sonyhp.NotConnected) as caught:
+                link.transport.open(1.0)
+        self.assertIn("another device may be using the control channel",
+                      str(caught.exception))
+
+
+class TestSettingPrecheck(DemoDaemonMixin, unittest.TestCase):
+    """A set the confirmed generation cannot carry never opens a link.
+
+    The pre-check runs the pure settings builder against the known state
+    before with_link can dial, so a bad key is refused without stealing the
+    one control session from the phone holding it.
+    """
+
+    def known_v2(self):
+        state = sonyhp.initial_state()
+        state["protocol"] = "v2"
+        state["name"] = "WH-1000XM6"
+        state["features"] = sonyhp.features_for("WH-1000XM6", "v2")
+        self.daemon.last_values = state
+
+    def test_a_key_the_confirmed_generation_cannot_carry_never_opens_a_link(self):
+        self.known_v2()
+        device = {"address": "AA:BB:CC:DD:EE:FF", "name": "WH-1000XM6"}
+        with mock.patch.object(sonyhp, "find_device", return_value=device), \
+                mock.patch.object(sonyhp.RfcommTransport, "open") as opener:
+            response = self.answer({"cmd": "set", "key": "touch-sensor", "value": "off"})
+        self.assertFalse(response["ok"])
+        self.assertIn("touch-sensor", response["error"])
+        opener.assert_not_called()
+
+    def test_a_supported_key_passes_the_precheck(self):
+        self.known_v2()
+        self.assertIsNone(self.daemon.precheck_setting(
+            {"cmd": "set", "key": "dsee", "value": "off"}))
 
 
 class TestLogging(LoggingResetMixin, unittest.TestCase):

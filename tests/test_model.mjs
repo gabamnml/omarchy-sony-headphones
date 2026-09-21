@@ -21,7 +21,8 @@ const names = [
   "nextMode", "clampLevel", "deviceOptions", "playbackSource", "sessionLabel",
   "present", "hasState", "SESSION_IDLE_MIN", "SESSION_IDLE_MAX",
   "SESSION_IDLE_DEFAULT", "clampSessionIdle", "settingKeyForRow", "isPending",
-  "refusedReason", "refusedSummary"
+  "refusedReason", "refusedSummary", "pausesLocalPlayback", "availabilityFor",
+  "eqBlockedByCodec"
 ]
 const Model = new Function(source + `\nreturn { ${names.join(", ")} }`)()
 
@@ -41,8 +42,9 @@ function test(name, body) {
 }
 
 // The rows a device speaks but the other generation does not, used to prove
-// the two protocols never bleed into each other.
-const V1_ONLY_ROWS = ["touch", "voice", "stc-focus"]
+// the two protocols never bleed into each other. Voice guidance used to be
+// v1-only; it is confirmed on the WH-1000XM5/XM6 over v2, so it is shared now.
+const V1_ONLY_ROWS = ["touch", "stc-focus"]
 const V2_ONLY_ROWS = ["listening-mode", "bgm-room-size", "connection-quality", "playback-source"]
 
 const XM4_FEATURES = [
@@ -51,7 +53,13 @@ const XM4_FEATURES = [
 ]
 const XM6_FEATURES = [
   "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
-  "pause-when-taken-off", "auto-power-off", "listening-mode", "multipoint"
+  "pause-when-taken-off", "voice-notifications", "auto-power-off", "listening-mode", "multipoint"
+]
+// The WH-1000XM5 set from FEATURE_SETS["v2"]: everything the XM6 has minus the
+// XM6-only listening-mode and multipoint capabilities.
+const XM5_FEATURES = [
+  "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
+  "pause-when-taken-off", "voice-notifications", "auto-power-off"
 ]
 const UNKNOWN_V1_FEATURES = [
   "battery", "equalizer", "dsee", "speak-to-chat", "speak-to-chat-focus",
@@ -60,7 +68,7 @@ const UNKNOWN_V1_FEATURES = [
 ]
 const UNKNOWN_V2_FEATURES = [
   "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
-  "pause-when-taken-off", "auto-power-off", "listening-mode", "multipoint"
+  "pause-when-taken-off", "voice-notifications", "auto-power-off", "listening-mode", "multipoint"
 ]
 
 const DEVICES = [
@@ -91,6 +99,34 @@ function xm6(overrides) {
   }, overrides)
 }
 
+function xm5(overrides) {
+  return Object.assign({
+    connected: true,
+    protocol: "v2",
+    nc_mode: "ambient-sound",
+    features: XM5_FEATURES,
+    devices: DEVICES,
+    speak_to_chat: true,
+    listening_mode: "background-music"
+  }, overrides)
+}
+
+// A WH-1000XM2 from FEATURE_SETS["v1"]: the equalizer plus the eq-sbc-only
+// presentation marker behind the availability rule.
+const XM2_FEATURES = [
+  "battery", "equalizer", "dsee", "nc-optimizer", "eq-sbc-only"
+]
+
+function xm2(overrides) {
+  return Object.assign({
+    connected: true,
+    protocol: "v1",
+    nc_mode: "ambient-sound",
+    features: XM2_FEATURES,
+    codec: "SBC"
+  }, overrides)
+}
+
 test("rowsFor is empty until a device is connected", function() {
   assert.deepEqual(Model.rowsFor(null), [])
   assert.deepEqual(Model.rowsFor(undefined), [])
@@ -108,8 +144,20 @@ test("rowsFor on a v2 WH-1000XM6", function() {
   assert.deepEqual(Model.rowsFor(xm6()), [
     "mode", "level", "focus", "eq", "listening-mode", "bgm-room-size",
     "dsee", "connection-quality", "stc", "stc-sensitivity", "stc-timeout",
-    "pause", "apo", "session", "playback-source"
+    "pause", "voice", "apo", "session", "playback-source"
   ])
+})
+
+test("rowsFor on a v2 WH-1000XM5 has no XM6-only rows", function() {
+  assert.deepEqual(Model.rowsFor(xm5()), [
+    "mode", "level", "focus", "eq", "dsee", "connection-quality",
+    "stc", "stc-sensitivity", "stc-timeout", "pause", "voice", "apo", "session"
+  ])
+  const xm6Rows = Model.rowsFor(xm6())
+  for (const key of ["listening-mode", "bgm-room-size", "playback-source"]) {
+    assert.ok(!Model.hasRow(Model.rowsFor(xm5()), key), key + " on an XM5")
+    assert.ok(Model.hasRow(xm6Rows, key), key + " missing on an XM6")
+  }
 })
 
 test("rowsFor on an unrecognised v1 device", function() {
@@ -124,7 +172,7 @@ test("rowsFor on an unrecognised v2 device", function() {
   assert.deepEqual(Model.rowsFor(state), [
     "mode", "eq", "listening-mode", "bgm-room-size", "dsee",
     "connection-quality", "stc", "stc-sensitivity", "stc-timeout", "pause",
-    "apo", "session", "playback-source"
+    "voice", "apo", "session", "playback-source"
   ])
 })
 
@@ -394,6 +442,48 @@ test("refusedSummary joins every refusal into one line", function() {
   assert.ok(summary.indexOf("no eq") !== -1, summary)
   assert.equal(Model.refusedSummary({}), "")
   assert.equal(Model.refusedSummary(null), "")
+})
+
+test("pausesLocalPlayback is selection-only on leaving the reported source", function() {
+  assert.equal(Model.pausesLocalPlayback("", "AA:BB:CC:DD:EE:01"), false)
+  assert.equal(Model.pausesLocalPlayback("aa:bb:cc:dd:ee:01", "AA:BB:CC:DD:EE:01"), false)
+  assert.equal(Model.pausesLocalPlayback("AA:BB:CC:DD:EE:02", "AA:BB:CC:DD:EE:01"), true)
+  assert.equal(Model.pausesLocalPlayback("AA", ""), true)
+})
+
+test("availabilityFor leaves rows with no rule alone", function() {
+  // An XM4 on LDAC has no eq-sbc-only marker, so nothing is blocked — not
+  // even the equalizer, and other rows on a blocked XM2 stay usable too.
+  assert.deepEqual(Model.availabilityFor(xm4({ codec: "LDAC" }), "eq"),
+                   { available: true, reason: "" })
+  assert.deepEqual(Model.availabilityFor(xm2({ codec: "LDAC" }), "dsee"),
+                   { available: true, reason: "" })
+  assert.deepEqual(Model.availabilityFor(xm2({ codec: "LDAC" }), "mystery"),
+                   { available: true, reason: "" })
+})
+
+test("availabilityFor greys the XM2 equalizer off SBC", function() {
+  for (const codec of ["LDAC", "ldac", "AAC", "aptX"]) {
+    const blocked = Model.availabilityFor(xm2({ codec }), "eq")
+    assert.equal(blocked.available, false, codec)
+    assert.equal(blocked.reason, "Equalizer needs the SBC codec", codec)
+  }
+  assert.equal(Model.eqBlockedByCodec(xm2({ codec: "LDAC" })), true)
+  assert.equal(Model.eqBlockedByCodec(xm4({ codec: "LDAC" })), false)
+})
+
+test("availabilityFor keeps the XM2 equalizer on SBC or an unknown codec", function() {
+  assert.deepEqual(Model.availabilityFor(xm2({ codec: "SBC" }), "eq"),
+                   { available: true, reason: "" })
+  assert.deepEqual(Model.availabilityFor(xm2({ codec: "sbc" }), "eq"),
+                   { available: true, reason: "" })
+  // An unknown or empty codec leaves the row usable rather than guessing.
+  for (const codec of ["", "unknown", "UNKNOWN", null, undefined]) {
+    const state = xm2({ codec })
+    assert.deepEqual(Model.availabilityFor(state, "eq"),
+                     { available: true, reason: "" }, String(codec))
+    assert.equal(Model.eqBlockedByCodec(state), false, String(codec))
+  }
 })
 
 if (failures > 0) {

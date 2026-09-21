@@ -110,7 +110,7 @@ class TestV2DemoDevice(unittest.TestCase):
         self.assertEqual(state["protocol"], "v2")
         for key in ("firmware", "codec", "battery", "nc_mode", "ambient_level",
                     "eq_preset", "speak_to_chat", "pause_when_taken_off",
-                    "auto_power_off", "stc_sensitivity"):
+                    "auto_power_off", "stc_sensitivity", "voice_notifications"):
             self.assertIsNotNone(state[key], key)
         self.assertEqual(state["codec"], "LDAC")
 
@@ -161,6 +161,11 @@ class TestV2DemoDevice(unittest.TestCase):
         sonyhp.apply_setting(self.link, "stc-timeout", "off")
         self.assertEqual(self.link.state["stc_sensitivity"], "low")
         self.assertEqual(self.link.state["stc_timeout"], "off")
+
+    def test_voice_guidance_round_trip(self):
+        for value in ("off", "on"):
+            sonyhp.apply_setting(self.link, "voice-notifications", value)
+            self.assertIs(self.link.state["voice_notifications"], value == "on")
 
 
 class TestV2DemoOnlySurface(unittest.TestCase):
@@ -380,6 +385,7 @@ class TestStubbornCoversEverySetting(unittest.TestCase):
         "dsee": "off",
         "speak-to-chat": "on",
         "pause-when-taken-off": "off",
+        "voice-notifications": "off",
         "connection-quality": "stable",
         "listening-mode": "cinema",
         "bgm-room-size": "cafe",

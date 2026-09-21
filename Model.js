@@ -213,6 +213,18 @@ function playbackSource(state) {
   return ""
 }
 
+// Whether picking `chosen` should pause playback on this machine. The headphones
+// report the active source's address; while this machine is the one playing that
+// address names the local source, so choosing any other peer is switching
+// playback away and the local players should pause. Selection-only: consulted
+// when the user picks a source, never on a state line, so a switch the phone
+// makes does not touch local playback.
+function pausesLocalPlayback(chosen, current) {
+  var target = String(chosen || "").trim().toLowerCase()
+  if (!target) return false
+  return target !== String(current || "").trim().toLowerCase()
+}
+
 function modeLabel(mode) {
   return MODE_LABELS[mode] || "Unknown"
 }
@@ -320,6 +332,40 @@ function optionLabel(options, value) {
     if (options[i].value === value) return options[i].label
   }
   return value || ""
+}
+
+// -- availability -----------------------------------------------------------
+
+// True while the equalizer is blocked by the current codec: the WH-1000XM2/XM3
+// (whose feature sets carry the "eq-sbc-only" presentation marker) honour the
+// equalizer only over SBC. The codec has to be known and not SBC
+// (case-insensitive); an unknown or empty codec leaves the row usable rather
+// than guessing. Reported, not confirmed.
+function eqBlockedByCodec(state) {
+  if (!supports(state && state.features, "eq-sbc-only")) return false
+  var codec = String((state && state.codec) || "").trim().toLowerCase()
+  if (codec === "" || codec === "unknown") return false
+  return codec !== "sbc"
+}
+
+// One rule per blocked-by-another-setting row: which row it gates, the reason
+// the tooltip shows, and the predicate on the state. More rules are data, not
+// code — add a line here, not a branch in availabilityFor.
+var AVAILABILITY_RULES = [
+  { row: "eq", reason: "Equalizer needs the SBC codec", blocked: eqBlockedByCodec }
+]
+
+// Whether the row is usable right now. A missing capability stays hidden via
+// rowsFor; this is only for a row that exists but is blocked by another
+// setting: shown, its control greyed, the reason in a tooltip. Anything with
+// no rule is available.
+function availabilityFor(state, rowKey) {
+  for (var i = 0; i < AVAILABILITY_RULES.length; i++) {
+    var rule = AVAILABILITY_RULES[i]
+    if (rule.row === rowKey && rule.blocked(state))
+      return { available: false, reason: rule.reason }
+  }
+  return { available: true, reason: "" }
 }
 
 // -- write-then-verify ------------------------------------------------------

@@ -319,6 +319,17 @@ V2_AUDIO_SUB_BGM = 0x09
 V2_AUDIO_SUB_BGM_ALT = 0x03
 V2_BGM_ROOM = {"my-room": 0x00, "living-room": 0x01, "cafe": 0x02}
 V2_BGM_ROOM_FROM_CODE = {v: k for k, v in V2_BGM_ROOM.items()}
+# A write to one of these that takes the whole link down with it is the
+# signature of a digital assistant blocking Background music: Sound Connect
+# greys the feature out while one is set ("check Voice control / Voice
+# assistant"), and the device resets when the write goes out anyway. Keeping
+# the keys listed lets a lost link carry that explanation instead of a bare
+# connection error.
+BGM_WRITE_KEYS = frozenset({"listening-mode", "bgm-room-size"})
+BGM_RESET_REASON = (
+    "the headphones reset during the write; a digital assistant may be set — "
+    "check Voice control / Voice assistant in Sound Connect"
+)
 
 V2_BATTERY_GET = 0x22
 V2_BATTERY_RET = 0x23
@@ -394,8 +405,11 @@ V2_ASC_SUBTYPES = (V2_ASC_SUBTYPE_WIND, 0x17, V2_ASC_SUBTYPE_QUERY, V2_ASC_SUBTY
 V2_ASC_PROBE_ORDER = (V2_ASC_SUBTYPE_QUERY, 0x17, V2_ASC_SUBTYPE_WIND, V2_ASC_SUBTYPE_AMBIENT)
 
 # The v2 generation dropped the classic preset table: firmware accepts only
-# these codes, plus Custom. The ten-band curve uses a symmetric gain range
-# stored biased by six.
+# these codes, plus Custom. The set is confirmed on the WH-1000XM6 by probing
+# each code and reading the reply; the other v2 models are offered the same
+# table unverified, and a code one refuses surfaces as a refused row rather
+# than a silent no-op. The ten-band curve uses a symmetric gain range stored
+# biased by six.
 V2_EQ_PRESETS = {
     "off": 0x00,
     "heavy": 0x30,
@@ -467,9 +481,15 @@ V1_FEATURES = {
 }
 V2_FEATURES = {
     "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
-    "pause-when-taken-off", "auto-power-off", "listening-mode", "multipoint",
+    "pause-when-taken-off", "voice-notifications", "auto-power-off", "listening-mode", "multipoint",
 }
 FEATURE_CEILINGS = {"v1": V1_FEATURES, "v2": V2_FEATURES}
+
+# Presentation-only markers: feature strings that gate a row's availability in
+# the panel, not a wire command. They ride in FEATURE_SETS (and therefore in
+# state["features"]) so Model.availabilityFor can read them, but they are
+# exempt from the generation-ceiling check below.
+UI_FEATURES = {"eq-sbc-only"}
 
 # What each model actually honours, verified against hardware where the status
 # says so and taken from Gadgetbridge's device coordinators otherwise. Sending a
@@ -485,18 +505,45 @@ FEATURE_SETS = {
         },
         "WH-1000XM3": {
             "battery", "equalizer", "dsee", "touch-sensor", "voice-notifications",
-            "auto-power-off", "auto-power-off-timer", "nc-optimizer",
+            "auto-power-off", "auto-power-off-timer", "nc-optimizer", "eq-sbc-only",
         },
         "WH-1000XM2": {
-            "battery", "equalizer", "dsee", "nc-optimizer",
+            "battery", "equalizer", "dsee", "nc-optimizer", "eq-sbc-only",
         },
     },
-    # The v2 generation: no touch panel, voice guidance or NC optimizer in this
-    # command set, and speak-to-chat carries no voice-focus option.
+    # The v2 generation: no touch panel or NC optimizer in this command
+    # set, and speak-to-chat carries no voice-focus option. Voice guidance
+    # (voice-notifications) is confirmed on the WH-1000XM6 (firmware 3.1.5
+    # answers the v1-shaped GET `46 01 01` with `47 01 00 03`) and on the
+    # WH-1000XM5 by capture; the remaining v2 models stay without it until
+    # hardware or a capture says otherwise.
     "v2": {
         "WH-1000XM6": {
             "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
-            "pause-when-taken-off", "auto-power-off", "listening-mode", "multipoint",
+            "pause-when-taken-off", "voice-notifications", "auto-power-off",
+            "listening-mode", "multipoint",
+        },
+        "WH-1000XM5": {
+            "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
+            "pause-when-taken-off", "voice-notifications", "auto-power-off",
+        },
+        "WF-1000XM5": {
+            "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
+            "pause-when-taken-off", "auto-power-off",
+        },
+        # "LinkBuds" is a substring of "LinkBuds S" and features_for matches by
+        # case-insensitive substring in dict order, so the longer name must come
+        # first or every LinkBuds S would resolve to the open-LinkBuds entry.
+        "LinkBuds S": {
+            "battery", "equalizer", "dsee", "speak-to-chat",
+            "pause-when-taken-off", "auto-power-off",
+        },
+        "LinkBuds": {
+            "battery", "equalizer", "dsee", "speak-to-chat",
+            "pause-when-taken-off", "auto-power-off",
+        },
+        "WH-CH720N": {
+            "battery", "equalizer", "dsee", "connection-quality", "auto-power-off",
         },
     },
 }
@@ -505,7 +552,7 @@ FEATURE_SETS = {
 # fail here at import rather than by writing an opcode the device cannot route.
 for _protocol, _models in FEATURE_SETS.items():
     for _model, _model_features in _models.items():
-        _outside = _model_features - FEATURE_CEILINGS[_protocol]
+        _outside = _model_features - FEATURE_CEILINGS[_protocol] - UI_FEATURES
         if _outside:
             raise RuntimeError(
                 f"{_model} claims {sorted(_outside)} outside the {_protocol} command set"
@@ -873,6 +920,11 @@ def v2_refresh_requests(subtype: int = V2_ASC_SUBTYPE_QUERY,
         v2_bgm_get(bgm_subtype),
         v2_cinema_get(),
         v2_device_list_get(),
+        # Voice guidance. The canonical v2 GET is the 2-byte `46 01`, but a
+        # WH-1000XM6 (firmware 3.1.5) was captured answering the v1-shaped
+        # 3-byte `46 01 01` with `47 01 00 03`, so the refresh sends the
+        # proven 3-byte shape.
+        req(bytes([VOICE_NOTIFICATIONS_GET, 0x01, 0x01]), MSG_COMMAND_2),
     ]
 
 
@@ -1165,6 +1217,11 @@ def apply_payload_v2(state: dict, msg_type: int, payload: bytes) -> bool:
                 state["devices"] = devices
                 state["playback_source"] = next(
                     (device["address"] for device in devices if device["playback"]), None)
+        # Voice guidance is inverted (0x00 = on) with the value at index 2;
+        # the trailing byte's meaning is unknown, so it is never required
+        # or interpreted beyond the length check.
+        if code in (VOICE_NOTIFICATIONS_RET, VOICE_NOTIFICATIONS_NOTIFY) and len(payload) >= 4:
+            state["voice_notifications"] = payload[2] == 0x00
         return state != before
 
     # v2 still reads firmware through the v1 opcode, so the branch has to live
@@ -2044,6 +2101,13 @@ class RfcommTransport(Transport):
             try:
                 self.sock = self.link._open(channel, timeout)
             except OSError as exc:
+                if exc.errno == errno.EBUSY:
+                    # One control session only: a phone holding it over
+                    # multipoint makes our open fail busy, so say so plainly
+                    # instead of burning through the remaining candidates.
+                    raise NotConnected(
+                        "another device may be using the control channel"
+                    ) from exc
                 last_error = exc
                 continue
             if attempt is None:
@@ -2120,6 +2184,9 @@ class Link:
         self.seq = 0
         self._buffer = bytearray()
         self.last_rx = 0.0
+        # Set when a Background-music write raises: the daemon reads it in
+        # lose_link to explain a link the write took down (see BGM_WRITE_KEYS).
+        self.interrupted_key: str | None = None
 
     # The socket stays reachable under its old name: the daemon selects on it
     # and the tests stand streams in for it. It lives on the transport.
@@ -2633,7 +2700,7 @@ SETTING_FEATURES = {
 # Setting keys that only exist on one generation. The feature list normally
 # gates them, but a stale or missing list must not let a write cross protocols,
 # so each builder refuses the other side's keys outright.
-V1_ONLY_SETTINGS = {"touch-sensor", "voice-notifications"}
+V1_ONLY_SETTINGS = {"touch-sensor"}
 V2_ONLY_SETTINGS = {"connection-quality", "listening-mode", "bgm-room-size", "playback-source"}
 
 # The fields both builders read before they branch on the key: the resolved
@@ -2818,6 +2885,17 @@ def setting_requests_v2(state: dict, key: str, value) -> list[tuple[int, bytes]]
         return [v2_bool_request(V2_SYSTEM_SET, V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF, enabled),
                 v2_system_get(V2_SYSTEM_SUB_PAUSE_WHEN_TAKEN_OFF)]
 
+    if key == "voice-notifications":
+        # The v1 builder's generic branch above is never reached on a v2
+        # link (the adapter routes to this builder), so v2 needs its own
+        # sibling. Unlike v1's 4-byte non-inverted shape, v2 is 3 bytes and
+        # inverted: 0x00 = on, 0x01 = off. The GET re-reads the value so
+        # write-then-verify confirms against the device's own answer.
+        enabled = parse_bool(value, state.get("voice_notifications"))
+        return [req(bytes([VOICE_NOTIFICATIONS_SET, 0x01, 0x00 if enabled else 0x01]),
+                    MSG_COMMAND_2),
+                req(bytes([VOICE_NOTIFICATIONS_GET, 0x01, 0x01]), MSG_COMMAND_2)]
+
     if key == "dsee":
         enabled = parse_bool(value, state.get("dsee"))
         return [v2_dsee_request(enabled), v2_dsee_get()]
@@ -2903,6 +2981,7 @@ def apply_setting(link: Link, key: str, value) -> dict:
     # The request list is built (and may refuse the key) before anything is
     # marked: a setting the builder rejects never claims to be in flight.
     _mark_pending(link, key)
+    link.interrupted_key = None
     before = dict(link.state)
     try:
         for msg_type, payload in requests:
@@ -2933,6 +3012,10 @@ def apply_setting(link: Link, key: str, value) -> dict:
         # transition) and re-raise so the connection/validation error path
         # still reports the failure. No refusal is recorded — refused is only
         # for an acknowledged write that did not move within the settle window.
+        # The exception is remembered when it struck a Background-music key, so
+        # the daemon can explain a link the write took down.
+        if key in BGM_WRITE_KEYS:
+            link.interrupted_key = key
         _settle_pending(link, key)
         raise
     return link.state
@@ -3168,6 +3251,8 @@ class DemoDeviceV2:
             {"address": "11:22:33:44:55:66", "name": "Laptop", "status": 0x02},
         ]
         self.playback_source = None
+        # Voice guidance, inverted on the v2 wire (0x00 = on).
+        self.voice_notifications = True
         # Opt-in no-move mode for the write-then-verify tests, off by default;
         # see DemoDevice.stubborn.
         self.stubborn = False
@@ -3294,6 +3379,19 @@ class DemoDeviceV2:
             if code == V2_PERI_SET_EXTENDED and sub == V2_PERI_SUB_SOURCE_SWITCH:
                 self.switch_source(payload)
                 return []
+            # Voice guidance, v2 shape: the value sits at index 2 and is
+            # inverted (0x00 = on); the trailing byte is echoed as 0x01 and
+            # carries no interpreted meaning. The GET is answered in either
+            # the canonical 2-byte (`46 01`) or the v1-shaped 3-byte
+            # (`46 01 01`) form.
+            if code == VOICE_NOTIFICATIONS_SET and not self.stubborn \
+                    and len(payload) >= 3 and payload[2] in (0x00, 0x01):
+                self.voice_notifications = payload[2] == 0x00
+            if code in (VOICE_NOTIFICATIONS_GET, VOICE_NOTIFICATIONS_SET) \
+                    and len(payload) >= 2:
+                return [(MSG_COMMAND_2, bytes([VOICE_NOTIFICATIONS_RET, 0x01,
+                                               0x00 if self.voice_notifications else 0x01,
+                                               0x01]))]
             return []
 
         if code == V2_INIT_REQUEST:
@@ -3519,6 +3617,11 @@ class Daemon:
     REQUEST_TIMEOUT = 2.0
     RETRY_MIN = 2.0
     RETRY_MAX = 30.0
+    # A link that dies sooner than this never proved itself: something else,
+    # a phone on multipoint, is taking the one control session back, so the
+    # retry delay has to grow rather than reset to the minimum. A link that
+    # held at least this long clears the delay for the next connect.
+    STABLE_AFTER = 10.0
     # The web UI is the only intended subscriber, so the cap is generous; it
     # exists to keep the select() watch list and the fd count bounded. A
     # subscription past it is refused rather than evicting an existing client:
@@ -3535,6 +3638,9 @@ class Daemon:
         self.retry_delay = self.RETRY_MIN
         self.next_attempt = 0.0
         self.next_poll = 0.0
+        # When the current link opened, for the flapping check in lose_link: a
+        # link that dies soon after connecting must not reset the retry delay.
+        self.connected_since: float | None = None
         self.last_emitted: dict | None = None
         self._lock = None
         self._socket_path = None
@@ -3559,6 +3665,10 @@ class Daemon:
         # release that arrives after the link died can still hand over the real
         # device name and battery rather than a blank initial_state().
         self.last_values: dict | None = None
+        # A link lost while a Background-music write was in flight is explained
+        # here, because lose_link rebuilds a blank state that would drop the
+        # reason. It clears when the same key is attempted again.
+        self.reset_refusal: dict[str, str] = {}
 
     # -- state out ----------------------------------------------------------
 
@@ -3585,6 +3695,13 @@ class Daemon:
         state["session"] = self.session
         state["session_policy"] = self.session_policy
         state["session_idle"] = self.session_idle
+        if self.reset_refusal:
+            pending = state.get("pending") or []
+            refused = dict(state.get("refused") or {})
+            for key, reason in self.reset_refusal.items():
+                if key not in pending:
+                    refused.setdefault(key, reason)
+            state["refused"] = refused
         return state
 
     def publish(self, state: dict | None = None) -> None:
@@ -3622,6 +3739,7 @@ class Daemon:
             # A fresh connection counts as activity: an on-demand session that
             # never receives a command still releases after its quiet spell.
             self.last_activity = self.clock()
+            self.connected_since = self.clock()
             LOG.info("connected to %s (demo)", self.link.state.get("name"))
             self.publish()
             return
@@ -3646,13 +3764,16 @@ class Daemon:
             return
 
         self.link = link
-        self.retry_delay = self.RETRY_MIN
+        self.connected_since = self.clock()
         self.next_poll = self.clock() + self.POLL_INTERVAL
         self.session = "held"
         self.last_activity = self.clock()
         self.publish()
 
     def lose_link(self, reason: str = "") -> None:
+        interrupted = self.link.interrupted_key if self.link is not None else None
+        if interrupted in BGM_WRITE_KEYS:
+            self.reset_refusal = {interrupted: BGM_RESET_REASON}
         if self.link is not None:
             # Remember what the live link last reported before it is cleared;
             # a later deliberate release falls back to it (see Daemon.release).
@@ -3664,6 +3785,15 @@ class Daemon:
         state = initial_state()
         state["address"] = self.preferred
         state["error"] = reason or None
+        if self.connected_since is not None \
+                and self.clock() - self.connected_since >= self.STABLE_AFTER:
+            # The link held long enough to prove itself, so the next connect
+            # starts from the minimum; a link that died young means something
+            # else is taking the one control session back, so back off.
+            self.retry_delay = self.RETRY_MIN
+        else:
+            self.retry_delay = min(self.RETRY_MAX, self.retry_delay * 2)
+        self.connected_since = None
         self.next_attempt = self.clock() + self.retry_delay
         LOG.error("link lost: %s", reason or "unknown reason")
         self.publish(state)
@@ -3696,6 +3826,9 @@ class Daemon:
         state["connected"] = False
         state["error"] = None
         self.released_state = state
+        # A deliberate hand-off, not a fight: the next connect starts fresh.
+        self.retry_delay = self.RETRY_MIN
+        self.connected_since = None
         LOG.info("session released%s", f": {reason}" if reason else "")
         self.publish(state)
 
@@ -3818,6 +3951,42 @@ class Daemon:
                 if attempt == 2:
                     raise
 
+    def _known_state(self) -> dict | None:
+        """The best confirmed state for a pre-check, without opening a link.
+
+        A live link's own state first; otherwise the first of the released
+        snapshot and the last live values that carries a confirmed protocol.
+        Anything without a protocol is a guess, so it does not count.
+        """
+        if self.link is not None:
+            return self.link.state
+        for candidate in (self.released_state, self.last_values):
+            if candidate and candidate.get("protocol"):
+                return candidate
+        return None
+
+    def precheck_setting(self, request: dict) -> str | None:
+        """Refuse a set/cycle the confirmed generation cannot carry, if known.
+
+        Runs the pure settings builder against the known state before any link
+        is opened, so a key the device cannot carry never costs a connect —
+        and never steals the one control session from the phone holding it.
+        Returns the refusal message, or None when the command may proceed.
+        """
+        known = self._known_state()
+        if known is None or not known.get("protocol"):
+            return None
+        builder = setting_requests_v2 if known.get("protocol") == "v2" else setting_requests
+        if str(request.get("cmd", "")) == "cycle":
+            key, value = "nc", "cycle"
+        else:
+            key, value = request.get("key", ""), request.get("value")
+        try:
+            builder(known, key, value)
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            return str(exc)
+        return None
+
     def handle_command(self, request: dict) -> dict:
         command = str(request.get("cmd", "status"))
 
@@ -3875,6 +4044,19 @@ class Daemon:
         if action is None:
             LOG.error("unknown command: %s", command)
             return {"ok": False, "error": f"unknown command {command!r}", "state": self.state()}
+
+        if command in ("set", "cycle"):
+            # Refuse what the confirmed generation cannot carry before any
+            # link is opened, so a bad key never steals the control session.
+            message = self.precheck_setting(request)
+            if message is not None:
+                LOG.error("command failed: %s: %s", _command_summary(request), message)
+                return {"ok": False, "error": message, "state": self.state()}
+
+        if command == "set":
+            # A fresh attempt supersedes the reset explanation for that key,
+            # whether or not the write that follows takes.
+            self.reset_refusal.pop(str(request.get("key", "")), None)
 
         try:
             self.with_link(action)

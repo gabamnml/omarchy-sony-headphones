@@ -253,6 +253,22 @@ class TestFeatures(unittest.TestCase):
         self.assertNotIn("speak-to-chat", sonyhp.features_for("WH-1000XM3"))
         self.assertNotIn("auto-power-off", sonyhp.features_for("WH-1000XM2"))
 
+    def test_the_eq_sbc_only_marker_scopes_to_xm2_xm3(self):
+        # The presentation marker behind Model.availabilityFor's equalizer
+        # rule: XM2/XM3 carry it, XM4 and every v2 set do not.
+        self.assertIn("eq-sbc-only", sonyhp.features_for("WH-1000XM2"))
+        self.assertIn("eq-sbc-only", sonyhp.features_for("WH-1000XM3"))
+        self.assertNotIn("eq-sbc-only", sonyhp.features_for("WH-1000XM4"))
+        for model in sonyhp.FEATURE_SETS["v2"]:
+            with self.subTest(model=model):
+                self.assertNotIn("eq-sbc-only", sonyhp.features_for(model, "v2"))
+
+    def test_an_unknown_v1_device_gets_the_ceiling(self):
+        # The ceiling carries wire commands only, so an unrecognised v1 name
+        # gets no presentation marker and its equalizer stays usable.
+        self.assertEqual(set(sonyhp.features_for("WH-XB910N", "v1")), sonyhp.V1_FEATURES)
+        self.assertNotIn("eq-sbc-only", sonyhp.features_for("WH-XB910N", "v1"))
+
     def test_the_name_only_has_to_contain_the_model(self):
         self.assertEqual(sonyhp.features_for("Gabriel's WH-1000XM4"), sonyhp.features_for("WH-1000XM4"))
 
