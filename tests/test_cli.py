@@ -432,8 +432,12 @@ class TestAvailabilityWiring(PanelSourceMixin, unittest.TestCase):
                          r"Model\s*\.\s*availabilityFor\s*\(\s*sony\s*\.\s*state\s*,")
 
     def test_the_blocked_reason_rides_in_a_tooltip(self):
-        self.assertIn("ToolTip.text", self.source)
-        self.assertIn("ToolTip.visible", self.source)
+        # The tooltip is the shell's own surface, so it takes the theme's
+        # [tooltip] colors, radius and shared delay. Qt's attached ToolTip is
+        # the unstyled default, so its return is the regression this pins.
+        self.assertNotIn("ToolTip.text", self.source)
+        self.assertRegex(self.source, r"PanelToolTip\s*\{")
+        self.assertRegex(self.source, r"visible:\s*\w+\s*\.\s*containsMouse")
         self.assertRegex(self.source, r"availability\s*\.\s*reason")
 
     def test_the_control_dims_while_staying_enabled_otherwise(self):

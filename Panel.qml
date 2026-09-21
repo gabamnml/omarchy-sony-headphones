@@ -358,8 +358,15 @@ Panel {
               hasCursor: root.hasCursorFor("mode")
               foreground: root.foreground
               implicitHeight: modeGroup.implicitHeight + Style.spacing.rowPaddingX
-              ToolTip.text: "Noise cancelling mode — currently " + Model.modeLabel(sony.mode)
-              ToolTip.visible: modeMouse.containsMouse && ToolTip.text !== ""
+
+              // The shell's own tooltip surface: it takes the theme's [tooltip]
+              // colors, radius and border, and the shared 400ms delay, so the
+              // popup reads as part of the shell instead of Qt's default chrome.
+              PanelToolTip {
+                visible: modeMouse.containsMouse
+                text: "Noise cancelling mode — currently " + Model.modeLabel(sony.mode)
+                fontFamily: root.fontFamily
+              }
 
               MouseArea {
                 id: modeMouse
@@ -389,9 +396,13 @@ Panel {
               hasCursor: root.hasCursorFor("level")
               foreground: root.foreground
               implicitHeight: Style.spacing.controlHeight
-              ToolTip.text: "Ambient sound level — currently " + sony.ambientLevel
-                + "/" + Model.MAX_AMBIENT_LEVEL + ". Drag or scroll to change."
-              ToolTip.visible: levelMouse.containsMouse && ToolTip.text !== ""
+
+              PanelToolTip {
+                visible: levelMouse.containsMouse
+                text: "Ambient sound level — currently " + sony.ambientLevel
+                  + "/" + Model.MAX_AMBIENT_LEVEL + ". Drag or scroll to change."
+                fontFamily: root.fontFamily
+              }
 
               MouseArea {
                 id: levelMouse
@@ -706,9 +717,12 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.underline: loggingLinkMouse.containsMouse
-              ToolTip.text: "Daemon log level — currently " + Model.loggingLabel(sony.state)
-                + ". Click to cycle errors → all → off."
-              ToolTip.visible: loggingLinkMouse.containsMouse
+              PanelToolTip {
+                visible: loggingLinkMouse.containsMouse
+                text: "Daemon log level — currently " + Model.loggingLabel(sony.state)
+                  + ". Click to cycle errors → all → off."
+                fontFamily: root.fontFamily
+              }
 
               MouseArea {
                 id: loggingLinkMouse
@@ -749,13 +763,16 @@ Panel {
     foreground: root.foreground
     implicitHeight: toggleContent.implicitHeight + Style.spacing.rowPaddingX
 
-    ToolTip.text: !toggleRow.available
-      ? toggleRow.availability.reason
-      : (toggleRow.tip !== ""
-         ? toggleRow.tip
-         : (toggleRow.hint !== "" ? toggleRow.hint : toggleRow.label)
-           + " — currently " + (toggleRow.checked ? "on" : "off"))
-    ToolTip.visible: rowMouse.containsMouse && ToolTip.text !== ""
+    PanelToolTip {
+      visible: rowMouse.containsMouse
+      text: !toggleRow.available
+        ? toggleRow.availability.reason
+        : (toggleRow.tip !== ""
+           ? toggleRow.tip
+           : (toggleRow.hint !== "" ? toggleRow.hint : toggleRow.label)
+             + " — currently " + (toggleRow.checked ? "on" : "off"))
+      fontFamily: root.fontFamily
+    }
 
     MouseArea {
       id: rowMouse
@@ -841,11 +858,14 @@ Panel {
     foreground: root.foreground
     implicitHeight: Style.spacing.controlHeight + Style.spacing.rowPaddingX
 
-    ToolTip.text: !dropdownRow.available
-      ? dropdownRow.availability.reason
-      : (dropdownRow.tip !== "" ? dropdownRow.tip : dropdownRow.label)
-        + " — currently: " + Model.optionLabel(dropdownRow.options, dropdownRow.value)
-    ToolTip.visible: dropdownMouse.containsMouse && ToolTip.text !== ""
+    PanelToolTip {
+      visible: dropdownMouse.containsMouse
+      text: !dropdownRow.available
+        ? dropdownRow.availability.reason
+        : (dropdownRow.tip !== "" ? dropdownRow.tip : dropdownRow.label)
+          + " — currently: " + Model.optionLabel(dropdownRow.options, dropdownRow.value)
+      fontFamily: root.fontFamily
+    }
 
     MouseArea {
       id: dropdownMouse
