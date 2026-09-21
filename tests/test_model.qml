@@ -3,7 +3,7 @@ import QtTest
 import "../Model.js" as Model
 
 // QtTest cover for the pure Model.js helpers, exercised in the real engine:
-//   QT_QPA_PLATFORM=offscreen qmltestrunner tests/tst_model.qml
+//   QT_QPA_PLATFORM=offscreen qmltestrunner tests/test_model.qml
 // The JS import climbs one directory because this file lives in tests/ while
 // Model.js lives at the repo root, so run it from the repo root.
 TestCase {

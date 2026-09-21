@@ -48,8 +48,8 @@ lint:
 # green; with it, a failing case fails the target.
 qmltest:
 	@if command -v qmltestrunner >/dev/null 2>&1; then \
-		echo "QML tests: QT_QPA_PLATFORM=offscreen qmltestrunner -input tests/tst_model.qml"; \
-		QT_QPA_PLATFORM=offscreen qmltestrunner -input tests/tst_model.qml; \
+		echo "QML tests: QT_QPA_PLATFORM=offscreen qmltestrunner -input tests/test_model.qml"; \
+		QT_QPA_PLATFORM=offscreen qmltestrunner -input tests/test_model.qml; \
 	else \
 		echo "WARNING: qmltestrunner not found -- QML tests SKIPPED (it ships in qt6-declarative at /usr/lib/qt6/bin)"; \
 	fi

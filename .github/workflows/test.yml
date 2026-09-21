@@ -28,3 +28,32 @@ jobs:
 
       - name: Lint
         run: make lint
+
+  qml:
+    runs-on: ubuntu-latest
+    # omarchy runs Arch's Qt (6.11 at the time of writing), and the QML uses
+    # inline `component` declarations that need Qt 6.5+. The runner's own Qt is
+    # 6.4 and install-qt-action's public mirrors stop at 6.9, so run this job in
+    # an Arch container instead. The dated tag fixes the starting snapshot;
+    # pacman then tracks Arch current, the same rolling source as omarchy.
+    container: archlinux:base-20260913.0.592969
+    steps:
+      # git is not in the archlinux base image, and checkout needs it.
+      - name: Install git
+        run: pacman -Syu --noconfirm --needed git
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Qt
+        run: |
+          pacman -S --noconfirm --needed make qt6-declarative
+          # Arch ships qmltestrunner and qmllint in /usr/lib/qt6/bin, not on PATH.
+          echo "/usr/lib/qt6/bin" >> "$GITHUB_PATH"
+
+      - name: QML tests
+        run: make qmltest
+
+      - name: QML lint
+        run: |
+          qmllint --version
+          qmllint Panel.qml Service.qml Model.js

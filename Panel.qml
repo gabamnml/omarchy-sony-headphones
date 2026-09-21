@@ -213,7 +213,9 @@ Panel {
     bar: root.bar
     text: Model.barText(sony.state, root.showBattery, root.vertical)
     slotSize: Style.bar.iconSlot * (root.showBattery && !root.vertical && sony.showing ? 2 : 1)
-    tooltipText: Model.tooltip(sony.state)
+    tooltipText: Model.tooltip(sony.state) + "\n"
+      + "Click: open panel · Right-click: cycle mode · Middle-click: refresh"
+      + (sony.showing ? " · Wheel: ambient level" : "")
     foreground: sony.showing ? root.barForeground : Qt.darker(root.barForeground, 1.6)
 
     onPressed: function(buttonCode) {
@@ -239,7 +241,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(360))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(600))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -356,6 +358,16 @@ Panel {
               hasCursor: root.hasCursorFor("mode")
               foreground: root.foreground
               implicitHeight: modeGroup.implicitHeight + Style.spacing.rowPaddingX
+              ToolTip.text: "Noise cancelling mode — currently " + Model.modeLabel(sony.mode)
+              ToolTip.visible: modeMouse.containsMouse && ToolTip.text !== ""
+
+              MouseArea {
+                id: modeMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                acceptedButtons: Qt.NoButton
+                onEntered: root.setCursor("mode")
+              }
 
               ButtonGroup {
                 id: modeGroup
@@ -377,8 +389,12 @@ Panel {
               hasCursor: root.hasCursorFor("level")
               foreground: root.foreground
               implicitHeight: Style.spacing.controlHeight
+              ToolTip.text: "Ambient sound level — currently " + sony.ambientLevel
+                + "/" + Model.MAX_AMBIENT_LEVEL + ". Drag or scroll to change."
+              ToolTip.visible: levelMouse.containsMouse && ToolTip.text !== ""
 
               MouseArea {
+                id: levelMouse
                 anchors.fill: parent
                 hoverEnabled: true
                 acceptedButtons: Qt.NoButton
@@ -458,6 +474,7 @@ Panel {
               options: Model.eqPresets(sony.state.protocol)
               value: String(sony.state.eq_preset || "off")
               onPicked: function(value) { sony.choose("eq", "eq_preset", value) }
+              tip: "Equalizer preset — the tone curve the headphones apply"
             }
 
             DropdownRow {
@@ -467,6 +484,7 @@ Panel {
               options: Model.LISTENING_MODE
               value: String(sony.state.listening_mode || "standard")
               onPicked: function(value) { sony.choose("listening-mode", "listening_mode", value) }
+              tip: "Listening mode — how the headphones colour sound for what is around you"
             }
 
             DropdownRow {
@@ -476,6 +494,7 @@ Panel {
               options: Model.BGM_ROOM_SIZE
               value: String(sony.state.bgm_room_size || "living-room")
               onPicked: function(value) { sony.choose("bgm-room-size", "bgm_room_size", value) }
+              tip: "Room — the space Background Music simulates"
             }
 
             ToggleRow {
@@ -493,6 +512,7 @@ Panel {
               options: Model.CONNECTION_QUALITY
               value: String(sony.state.connection_quality || "sound-quality")
               onPicked: function(value) { sony.choose("connection-quality", "connection_quality", value) }
+              tip: "Bluetooth quality — trade bitrate for a stronger link, or the other way around"
             }
           }
 
@@ -528,6 +548,7 @@ Panel {
               options: Model.STC_SENSITIVITY
               value: String(sony.state.stc_sensitivity || "auto")
               onPicked: function(value) { sony.choose("stc-sensitivity", "stc_sensitivity", value) }
+              tip: "Speak-to-Chat sensitivity — how readily your voice pauses playback"
             }
 
             DropdownRow {
@@ -537,6 +558,7 @@ Panel {
               options: Model.STC_TIMEOUT
               value: String(sony.state.stc_timeout || "standard")
               onPicked: function(value) { sony.choose("stc-timeout", "stc_timeout", value) }
+              tip: "Resume delay — how long after you stop talking playback returns"
             }
 
             ToggleRow {
@@ -544,6 +566,7 @@ Panel {
               visible: Model.hasRow(rows, "stc-focus")
               label: "Voice focus while chatting"
               checked: !!sony.state.stc_focus_on_voice
+              tip: "Voice focus while chatting — pass voices through while Speak-to-Chat holds playback"
             }
           }
 
@@ -572,6 +595,7 @@ Panel {
               visible: Model.hasRow(rows, "pause")
               label: "Pause when taken off"
               checked: !!sony.state.pause_when_taken_off
+              tip: "Pause when taken off — stop playback when the headphones leave your head"
             }
 
             ToggleRow {
@@ -579,6 +603,7 @@ Panel {
               visible: Model.hasRow(rows, "touch")
               label: "Touch controls"
               checked: !!sony.state.touch_sensor
+              tip: "Touch controls — the earcup touch panel for play, volume and calls"
             }
 
             ToggleRow {
@@ -586,6 +611,7 @@ Panel {
               visible: Model.hasRow(rows, "voice")
               label: "Voice guidance"
               checked: !!sony.state.voice_notifications
+              tip: "Voice guidance — spoken status announcements from the headphones"
             }
 
             DropdownRow {
@@ -595,6 +621,7 @@ Panel {
               options: Model.autoPowerOffOptions(root.features)
               value: String(sony.state.auto_power_off || "off")
               onPicked: function(value) { sony.choose("auto-power-off", "auto_power_off", value) }
+              tip: "Auto power-off — when the headphones turn themselves off"
             }
 
             // The one control session a Sony headset allows: held by the
@@ -608,6 +635,7 @@ Panel {
                 ? "Take the control session back"
                 : "Hand the control session to a phone"
               checked: sony.session === "held"
+              tip: sony.session === "released" ? "Control session — now released to a phone. Activate to take it back." : "Control session — now held by the widget. Activate to hand it to a phone."
             }
           }
 
@@ -636,6 +664,7 @@ Panel {
               options: Model.deviceOptions(sony.state)
               value: String(Model.playbackSource(sony.state))
               onPicked: function(value) { sony.choosePlaybackSource(value) }
+              tip: "Playback source — which paired Bluetooth device owns playback"
             }
           }
 
@@ -677,6 +706,9 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.underline: loggingLinkMouse.containsMouse
+              ToolTip.text: "Daemon log level — currently " + Model.loggingLabel(sony.state)
+                + ". Click to cycle errors → all → off."
+              ToolTip.visible: loggingLinkMouse.containsMouse
 
               MouseArea {
                 id: loggingLinkMouse
@@ -702,9 +734,13 @@ Panel {
     property string label: ""
     property string hint: ""
     property bool checked: false
+    property string tip: ""
     // A row the model lacks stays hidden (rowsFor); a row that exists but is
     // blocked by another setting is shown with its control greyed, the label
     // at full contrast, and the reason in a tooltip — no persistent line.
+    // An available row's tooltip says what the setting does and where it is
+    // now; `tip` overrides the composed hint-and-state text for rows whose
+    // label alone would not carry the purpose.
     readonly property var availability: Model.availabilityFor(sony.state, rowKey)
     readonly property bool available: availability.available
 
@@ -713,8 +749,13 @@ Panel {
     foreground: root.foreground
     implicitHeight: toggleContent.implicitHeight + Style.spacing.rowPaddingX
 
-    ToolTip.text: toggleRow.availability.reason
-    ToolTip.visible: !toggleRow.available && rowMouse.containsMouse
+    ToolTip.text: !toggleRow.available
+      ? toggleRow.availability.reason
+      : (toggleRow.tip !== ""
+         ? toggleRow.tip
+         : (toggleRow.hint !== "" ? toggleRow.hint : toggleRow.label)
+           + " — currently " + (toggleRow.checked ? "on" : "off"))
+    ToolTip.visible: rowMouse.containsMouse && ToolTip.text !== ""
 
     MouseArea {
       id: rowMouse
@@ -786,9 +827,12 @@ Panel {
     property string label: ""
     property var options: []
     property string value: ""
+    property string tip: ""
     signal picked(string value)
     // Same availability contract as ToggleRow: the label stays at full
     // contrast, only the control dims, and the reason rides in a tooltip.
+    // The composed text names the option list's label for the current value,
+    // so the tooltip reads "Sound quality (LDAC)" rather than the wire token.
     readonly property var availability: Model.availabilityFor(sony.state, rowKey)
     readonly property bool available: availability.available
 
@@ -797,8 +841,11 @@ Panel {
     foreground: root.foreground
     implicitHeight: Style.spacing.controlHeight + Style.spacing.rowPaddingX
 
-    ToolTip.text: dropdownRow.availability.reason
-    ToolTip.visible: !dropdownRow.available && dropdownMouse.containsMouse
+    ToolTip.text: !dropdownRow.available
+      ? dropdownRow.availability.reason
+      : (dropdownRow.tip !== "" ? dropdownRow.tip : dropdownRow.label)
+        + " — currently: " + Model.optionLabel(dropdownRow.options, dropdownRow.value)
+    ToolTip.visible: dropdownMouse.containsMouse && ToolTip.text !== ""
 
     MouseArea {
       id: dropdownMouse

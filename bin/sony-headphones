@@ -513,10 +513,10 @@ FEATURE_SETS = {
     },
     # The v2 generation: no touch panel or NC optimizer in this command
     # set, and speak-to-chat carries no voice-focus option. Voice guidance
-    # (voice-notifications) is confirmed on the WH-1000XM6 (firmware 3.1.5
-    # answers the v1-shaped GET `46 01 01` with `47 01 00 03`) and on the
-    # WH-1000XM5 by capture; the remaining v2 models stay without it until
-    # hardware or a capture says otherwise.
+    # (voice-notifications) is confirmed on-device on the WH-1000XM6
+    # (firmware 3.1.5, read and write) and reported, not confirmed, on the
+    # WH-1000XM5 (itsgg report, firmware 2.5.1); the remaining v2 models
+    # stay without it until hardware or a capture says otherwise.
     "v2": {
         "WH-1000XM6": {
             "battery", "equalizer", "dsee", "connection-quality", "speak-to-chat",
@@ -920,10 +920,10 @@ def v2_refresh_requests(subtype: int = V2_ASC_SUBTYPE_QUERY,
         v2_bgm_get(bgm_subtype),
         v2_cinema_get(),
         v2_device_list_get(),
-        # Voice guidance. The canonical v2 GET is the 2-byte `46 01`, but a
-        # WH-1000XM6 (firmware 3.1.5) was captured answering the v1-shaped
-        # 3-byte `46 01 01` with `47 01 00 03`, so the refresh sends the
-        # proven 3-byte shape.
+        # Voice guidance. The 2-byte `46 01` is the Gadgetbridge-shaped
+        # GET, never sent on-device; a WH-1000XM6 (firmware 3.1.5) was
+        # captured answering the 3-byte `46 01 01` with `47 01 00 03`,
+        # so the refresh sends the captured 3-byte shape.
         req(bytes([VOICE_NOTIFICATIONS_GET, 0x01, 0x01]), MSG_COMMAND_2),
     ]
 
@@ -3382,8 +3382,8 @@ class DemoDeviceV2:
             # Voice guidance, v2 shape: the value sits at index 2 and is
             # inverted (0x00 = on); the trailing byte is echoed as 0x01 and
             # carries no interpreted meaning. The GET is answered in either
-            # the canonical 2-byte (`46 01`) or the v1-shaped 3-byte
-            # (`46 01 01`) form.
+            # the Gadgetbridge-shaped 2-byte (`46 01`) or the captured
+            # 3-byte (`46 01 01`) form.
             if code == VOICE_NOTIFICATIONS_SET and not self.stubborn \
                     and len(payload) >= 3 and payload[2] in (0x00, 0x01):
                 self.voice_notifications = payload[2] == 0x00
