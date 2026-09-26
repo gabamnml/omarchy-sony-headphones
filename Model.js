@@ -54,6 +54,19 @@ var STC_TIMEOUT = [
   { value: "off", label: "Until I stop" }
 ]
 
+var PRIORITY = [
+  { value: "sound-quality", label: "Sound quality" },
+  { value: "connection", label: "Stable connection" }
+]
+
+// The codecs PipeWire can switch to right now, as dropdown options. They come
+// from the helper best first; nothing is listed that is not on offer.
+function codecOptions(codecs) {
+  var options = []
+  for (var i = 0; i < (codecs || []).length; i++) options.push({ value: codecs[i], label: codecs[i] })
+  return options
+}
+
 // The timer options exist only on models that honour them; a WH-1000XM4
 // answers "when taken off" whatever timer you ask for.
 function autoPowerOffOptions(features) {

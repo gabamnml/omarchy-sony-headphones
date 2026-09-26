@@ -9,6 +9,7 @@ Run with: python3 tests/test_protocol.py
 """
 
 import importlib.util
+import json
 import os
 import shutil
 import socket
@@ -278,7 +279,8 @@ class TestSettings(unittest.TestCase):
             "voice-notifications": "on", "dsee": "on", "speak-to-chat": "on",
             "pause-when-taken-off": "on", "touch-sensor": "on",
         }
-        self.assertEqual(sorted(values), sonyhp.SETTING_KEYS)
+        # The priority is v2's and the codec PipeWire's; both have tests of their own.
+        self.assertEqual(sorted(set(values) | {"priority", "codec"}), sonyhp.SETTING_KEYS)
         for key, value in values.items():
             requests = sonyhp.setting_requests(state, key, value)
             self.assertTrue(requests, key)
@@ -383,6 +385,462 @@ class TestFeatures(unittest.TestCase):
     def test_an_unknown_device_gets_everything(self):
         self.assertEqual(set(sonyhp.features_for("WH-XB910N")), sonyhp.ALL_FEATURES)
         self.assertEqual(set(sonyhp.features_for(None)), sonyhp.ALL_FEATURES)
+
+
+# -- Protocol v2 -----------------------------------------------------------------
+#
+# Reply payloads below are the ones a WH-1000XM5 on firmware 2.5.1 sent.
+
+XM5_INIT_REPLY = bytes.fromhex("01 00 03 00 20 16 00 00")
+
+
+def v2_state(**changes):
+    state = sonyhp.initial_state()
+    state.update(protocol=2, features=[], name="WH-1000XM5")
+    link = sonyhp.DemoLink(model="WH-1000XM5")
+    link.refresh()
+    state.update(functions=link.state["functions"], touch_slot=link.state["touch_slot"],
+                 features=link.state["features"])
+    state.update(changes)
+    return state
+
+
+class TestV2Handshake(unittest.TestCase):
+    def handshake(self, reply):
+        link = sonyhp.Link("AA:BB:CC:DD:EE:FF")
+        link.sock = FakeStream(sonyhp.encode_message(sonyhp.MSG_COMMAND_1, 0, reply))
+        return link, link._handshake()
+
+    def test_an_eight_byte_init_reply_means_v2(self):
+        link, ok = self.handshake(XM5_INIT_REPLY)
+        self.assertTrue(ok)
+        self.assertEqual(link.state["protocol"], 2)
+        self.assertEqual(link.state["features"], [], "nothing is offered before the device lists it")
+
+    def test_a_four_byte_init_reply_means_v1(self):
+        link, ok = self.handshake(bytes([0x01, 0x00, 0x40, 0x10]))
+        self.assertTrue(ok)
+        self.assertEqual(link.state["protocol"], 1)
+
+    def test_an_unknown_init_reply_is_refused(self):
+        with self.assertRaises(sonyhp.NotConnected):
+            self.handshake(bytes([0x01, 0x00, 0x03]))
+
+
+class TestV2Discovery(unittest.TestCase):
+    def devices(self, info):
+        def fake(*args, **kwargs):
+            if args[0] == "devices":
+                return "Device AC:80:0A:57:32:9D WH-1000XM5\n"
+            return info
+        with mock.patch.object(sonyhp, "bluetoothctl", side_effect=fake):
+            return sonyhp.connected_devices()
+
+    def test_the_v2_service_is_recognised(self):
+        device, = self.devices(f"\tUUID: Vendor specific ({sonyhp.SERVICE_UUID_V2})\n")
+        self.assertEqual(device["service"], sonyhp.SERVICE_UUID_V2_BYTES)
+
+    def test_the_v2_service_wins_when_both_are_offered(self):
+        device, = self.devices(f"UUID: ({sonyhp.SERVICE_UUID})\nUUID: ({sonyhp.SERVICE_UUID_V2})\n")
+        self.assertEqual(device["service"], sonyhp.SERVICE_UUID_V2_BYTES)
+
+    def test_a_v1_device_keeps_the_v1_service(self):
+        device, = self.devices(f"UUID: ({sonyhp.SERVICE_UUID})\n")
+        self.assertEqual(device["service"], sonyhp.SERVICE_UUID_BYTES)
+
+    def test_the_link_looks_up_the_service_the_device_offers(self):
+        link = sonyhp.Link.for_device({"address": "AC:80:0A:57:32:9D", "name": "WH-1000XM5",
+                                       "service": sonyhp.SERVICE_UUID_V2_BYTES})
+        with mock.patch.object(sonyhp, "sdp_channel", return_value=None) as sdp, \
+                mock.patch.object(sonyhp, "cached_channel", return_value=None):
+            with self.assertRaises(sonyhp.NotConnected):
+                link.connect()
+        self.assertEqual(sdp.call_args[0][1], sonyhp.SERVICE_UUID_V2_BYTES)
+
+
+class TestV2Replies(unittest.TestCase):
+    def setUp(self):
+        self.state = sonyhp.initial_state()
+        self.state.update(protocol=2, features=[])
+
+    def apply(self, payload, msg_type=None):
+        return sonyhp.apply_payload(self.state, msg_type or sonyhp.MSG_COMMAND_1, bytes.fromhex(payload))
+
+    def test_support_lists_become_features(self):
+        self.apply("07 00 06 10 ff 20 ff 50 0a fc 09 f1 23 25 21")
+        self.apply("07 00 01 41 25", sonyhp.MSG_COMMAND_2)
+        self.assertEqual(self.state["features"], ["auto-power-off", "battery", "equalizer",
+                                                  "pause-when-taken-off", "speak-to-chat",
+                                                  "voice-notifications"])
+        self.assertEqual(self.state["functions"]["table2"], [0x41])
+
+    def test_a_truncated_support_list_is_ignored(self):
+        self.assertFalse(self.apply("07 00 06 10 ff 20"))
+        self.assertIsNone(self.state["functions"])
+
+    def test_the_touch_panel_slot_is_found_by_name(self):
+        self.apply("d1 d2 00 01 12" + b"MULTIPOINT_SETTING".hex())
+        self.assertIsNone(self.state["touch_slot"])
+        self.apply("d1 d1 00 01 13" + b"TOUCH_PANEL_SETTING".hex() + "00")
+        self.assertEqual(self.state["touch_slot"], 0xD1)
+        self.assertIn("touch-sensor", self.state["features"])
+        self.apply("d7 d1 00 00")
+        self.assertIs(self.state["touch_sensor"], True)
+        self.apply("d9 d1 00 01")
+        self.assertIs(self.state["touch_sensor"], False)
+
+    def test_another_slot_is_not_mistaken_for_the_touch_panel(self):
+        self.state["touch_slot"] = 0xD1
+        self.apply("d7 d2 00 01")
+        self.assertIsNone(self.state["touch_sensor"])
+
+    def test_battery_codec_and_firmware(self):
+        self.apply("23 00 1b 00")
+        self.apply("13 02 10")
+        self.apply("05 02 05" + b"2.5.1".hex())
+        self.assertEqual((self.state["battery"], self.state["charging"]), (27, False))
+        self.assertEqual(self.state["codec"], "LDAC")
+        self.assertEqual(self.state["firmware"], "2.5.1")
+        self.apply("25 00 1c 01")
+        self.assertEqual((self.state["battery"], self.state["charging"]), (28, True))
+
+    def test_ambient_sound_control(self):
+        self.apply("67 17 01 01 01 01 0f")
+        self.assertEqual(self.state["nc_mode"], "ambient-sound")
+        self.assertEqual(self.state["ambient_level"], 15)
+        self.assertIs(self.state["focus_on_voice"], True)
+        self.assertIs(self.state["supports_wind"], False)
+        self.apply("69 17 01 01 00 01 0f")
+        self.assertEqual(self.state["nc_mode"], "noise-cancelling")
+        self.apply("69 17 01 00 00 01 0f")
+        self.assertEqual(self.state["nc_mode"], "off")
+
+    def test_equalizer(self):
+        self.apply("59 00 16 06 11 0a 0a 0a 0a 0a")
+        self.assertEqual(self.state["eq_preset"], "bass-boost")
+        self.assertEqual(self.state["eq_bass"], 7)
+        self.apply("57 00 a0 06 0b 0c 07 0a 0e 09")
+        self.assertEqual(self.state["eq_preset"], "manual")
+        self.assertEqual(self.state["eq_bands"], [2, -3, 0, 4, -1])
+
+    def test_ten_band_equalizers_are_left_alone(self):
+        self.assertFalse(self.apply("57 00 a0 0a " + "06 " * 10))
+
+    def test_on_off_bytes_are_inverted(self):
+        self.apply("f7 01 00")
+        self.apply("f7 0c 01 01")
+        self.apply("47 01 00 01", sonyhp.MSG_COMMAND_2)
+        self.assertIs(self.state["pause_when_taken_off"], True)
+        self.assertIs(self.state["speak_to_chat"], False)
+        self.assertIs(self.state["voice_notifications"], True)
+
+    def test_priority(self):
+        self.apply("e7 00 00")
+        self.assertEqual(self.state["priority"], "sound-quality")
+        self.apply("e9 00 01")
+        self.assertEqual(self.state["priority"], "connection")
+        self.assertFalse(self.apply("e9 00 07"))
+
+    def test_dsee_is_not_inverted(self):
+        self.apply("e7 01 00")
+        self.assertIs(self.state["dsee"], False)
+        self.apply("e9 01 01")
+        self.assertIs(self.state["dsee"], True)
+
+    def test_speak_to_chat_config_and_auto_power_off(self):
+        self.apply("fb 0c 00 01")
+        self.apply("27 05 10 00")
+        self.assertEqual((self.state["stc_sensitivity"], self.state["stc_timeout"]), ("auto", "standard"))
+        self.assertEqual(self.state["auto_power_off"], "when-taken-off")
+        self.apply("29 05 11 00")
+        self.assertEqual(self.state["auto_power_off"], "off")
+
+    def test_v1_payloads_are_not_read_as_v2(self):
+        self.assertFalse(self.apply("67 02 01 02 00 01 01 11"))
+        self.assertFalse(self.apply("11 00 50 00"))
+
+
+class TestV2Requests(unittest.TestCase):
+    def setUp(self):
+        self.state = v2_state(nc_mode="ambient-sound", ambient_level=15, focus_on_voice=True)
+
+    def payloads(self, key, value):
+        return [(t, p.hex(" ")) for t, p in sonyhp.setting_requests(self.state, key, value)]
+
+    def test_modes(self):
+        self.assertEqual(self.payloads("nc", "noise-cancelling"), [(0x0C, "68 17 01 01 00 01 0f")])
+        self.assertEqual(self.payloads("nc", "off"), [(0x0C, "68 17 01 00 00 01 0f")])
+        self.assertEqual(self.payloads("ambient-level", 7), [(0x0C, "68 17 01 01 01 01 07")])
+        self.assertEqual(self.payloads("focus-on-voice", "off"), [(0x0C, "68 17 01 01 01 00 0f")])
+
+    def test_equalizer(self):
+        self.assertEqual(self.payloads("eq", "bass-boost"), [(0x0C, "58 00 16 00")])
+        self.assertEqual(self.payloads("eq-bands", "1,2,-3,0,4,-1"), [(0x0C, "58 00 a0 06 0b 0c 07 0a 0e 09")])
+
+    def test_toggles(self):
+        self.assertEqual(self.payloads("speak-to-chat", "on"), [(0x0C, "f8 0c 00 01")])
+        self.assertEqual(self.payloads("pause-when-taken-off", "off"), [(0x0C, "f8 01 01")])
+        self.assertEqual(self.payloads("dsee", "on"), [(0x0C, "e8 01 01")])
+        self.assertEqual(self.payloads("voice-notifications", "off"), [(0x0E, "48 01 01")])
+
+    def test_speak_to_chat_config_and_auto_power_off(self):
+        self.assertEqual(self.payloads("stc-sensitivity", "high"), [(0x0C, "fc 0c 01 01")])
+        self.assertEqual(self.payloads("auto-power-off", "off"), [(0x0C, "28 05 11 00")])
+
+    def test_priority(self):
+        self.assertEqual(self.payloads("priority", "connection"), [(0x0C, "e8 00 01")])
+        self.assertEqual(self.payloads("priority", "sound-quality"), [(0x0C, "e8 00 00")])
+        with self.assertRaises(ValueError):
+            sonyhp.setting_requests(self.state, "priority", "loudest")
+        with self.assertRaises(ValueError, msg="v1 has no priority setting here"):
+            sonyhp.setting_requests(sonyhp.initial_state(), "priority", "connection")
+
+    def test_touch_panel_off_asks_for_alerts_first(self):
+        self.assertEqual(self.payloads("touch-sensor", "off"), [(0x0C, "94 00 00"), (0x0C, "d8 d1 00 01")])
+        self.assertEqual(self.payloads("touch-sensor", "on"), [(0x0C, "d8 d1 00 00")])
+
+    def test_what_the_device_did_not_list_is_refused(self):
+        for key, value in (("auto-power-off", "30-min"), ("stc-focus-on-voice", "on"),
+                           ("nc", "wind-noise-reduction")):
+            with self.assertRaises(ValueError, msg=key):
+                sonyhp.setting_requests(self.state, key, value)
+        bare = v2_state(functions={"table1": [], "table2": []}, touch_slot=None, features=[])
+        for key, value in (("eq", "vocal"), ("dsee", "on"), ("touch-sensor", "off"), ("nc", "off")):
+            with self.assertRaises(ValueError, msg=key):
+                sonyhp.setting_requests(bare, key, value)
+
+    def test_poll_and_power_off(self):
+        self.assertEqual([p.hex(" ") for _, p in sonyhp.battery_requests(self.state)], ["22 00"])
+        self.assertEqual(sonyhp.power_off_request(self.state)[1].hex(" "), "24 03 01")
+        self.assertEqual(sonyhp.power_off_request(sonyhp.initial_state())[1].hex(" "), "22 00")
+
+    def test_refresh_only_asks_for_what_is_listed(self):
+        codes = [p[:2].hex(" ") for _, p in sonyhp.refresh_requests(self.state)]
+        self.assertEqual(codes, ["04 02", "12 02", "66 17", "56 00", "e6 01", "e6 00", "f6 0c",
+                                 "fa 0c", "f6 01", "26 05", "d6 d1", "46 01", "22 00"])
+        bare = v2_state(functions={"table1": [], "table2": []}, touch_slot=None)
+        self.assertEqual([p.hex(" ") for _, p in sonyhp.refresh_requests(bare)], ["04 02"])
+
+
+class TestV2Alerts(unittest.TestCase):
+    def test_only_touch_panel_alerts_are_answered(self):
+        answer = sonyhp.alert_confirmation(sonyhp.MSG_COMMAND_1, bytes.fromhex("99 00 0b 01"))
+        self.assertEqual(answer[1].hex(" "), "98 00 0b 01")
+        for other in ("99 00 07 01", "99 01 0b 01", "99 00 0b", "69 17 01 01 00 01 0f"):
+            self.assertIsNone(sonyhp.alert_confirmation(sonyhp.MSG_COMMAND_1, bytes.fromhex(other)), other)
+
+    def test_an_alert_nobody_asked_for_goes_unanswered(self):
+        link = sonyhp.Link("AA:BB:CC:DD:EE:FF")
+        link.dispatch(sonyhp.MSG_COMMAND_1, bytes.fromhex("99 00 0b 01"))
+        self.assertEqual(link._outbox, [])
+
+    def test_a_drop_after_confirming_is_reported_as_reconnecting(self):
+        link = sonyhp.DemoLink(model="WH-1000XM5")
+        link.refresh()
+
+        def drop(msg_type, payload, wait_ack=True):
+            if payload[0] == sonyhp.ALERT_SET_PARAM:
+                raise ConnectionResetError(104, "Connection reset by peer")
+            return sonyhp.DemoLink.write(link, msg_type, payload, wait_ack)
+
+        with mock.patch.object(link, "write", side_effect=drop):
+            with self.assertRaises(sonyhp.Reconnecting):
+                sonyhp.apply_setting(link, "touch-sensor", "off")
+        self.assertFalse(link.confirm_alerts)
+
+    def test_any_other_drop_is_still_an_error(self):
+        link = sonyhp.DemoLink(model="WH-1000XM5")
+        link.refresh()
+        with mock.patch.object(link, "write", side_effect=ConnectionResetError(104, "reset")):
+            with self.assertRaises(ConnectionResetError):
+                sonyhp.apply_setting(link, "dsee", "on")
+
+
+class TestV2DemoDevice(unittest.TestCase):
+    """Round trips through the WH-1000XM5 stand-in."""
+
+    def setUp(self):
+        self.link = sonyhp.DemoLink(model="WH-1000XM5")
+        self.link.refresh()
+
+    def test_refresh_discovers_features_and_fills_in_the_state(self):
+        state = self.link.state
+        self.assertEqual(state["protocol"], 2)
+        self.assertEqual(state["features"], ["auto-power-off", "battery", "connection-priority", "dsee",
+                                             "equalizer", "pause-when-taken-off", "speak-to-chat",
+                                             "touch-sensor", "voice-notifications"])
+        for key in ("firmware", "codec", "battery", "nc_mode", "ambient_level", "eq_preset",
+                    "dsee", "speak_to_chat", "stc_sensitivity", "pause_when_taken_off",
+                    "auto_power_off", "touch_sensor", "voice_notifications"):
+            self.assertIsNotNone(state[key], key)
+
+    def test_modes_and_level(self):
+        for mode in ("noise-cancelling", "off", "ambient-sound"):
+            sonyhp.apply_setting(self.link, "nc", mode)
+            self.assertEqual(self.link.state["nc_mode"], mode)
+        sonyhp.apply_setting(self.link, "nc", "noise-cancelling")
+        sonyhp.apply_setting(self.link, "ambient-level", 4)
+        self.assertEqual((self.link.state["nc_mode"], self.link.state["ambient_level"]), ("ambient-sound", 4))
+
+    def test_equalizer(self):
+        sonyhp.apply_setting(self.link, "eq-bands", "3,-2,0,1,4,-1")
+        self.assertEqual(self.link.state["eq_preset"], "manual")
+        self.assertEqual(self.link.state["eq_bands"], [-2, 0, 1, 4, -1])
+        sonyhp.apply_setting(self.link, "eq", "vocal")
+        self.assertEqual(self.link.state["eq_preset"], "vocal")
+
+    def test_every_toggle_flips_both_ways(self):
+        for key, state_key in (("dsee", "dsee"), ("speak-to-chat", "speak_to_chat"),
+                               ("pause-when-taken-off", "pause_when_taken_off"),
+                               ("voice-notifications", "voice_notifications")):
+            for value in (True, False, True):
+                sonyhp.apply_setting(self.link, key, "on" if value else "off")
+                self.assertIs(self.link.state[state_key], value, key)
+
+    def test_speak_to_chat_config(self):
+        sonyhp.apply_setting(self.link, "stc-sensitivity", "low")
+        sonyhp.apply_setting(self.link, "stc-timeout", "off")
+        self.assertEqual((self.link.state["stc_sensitivity"], self.link.state["stc_timeout"]), ("low", "off"))
+
+    def test_priority_changes_the_codecs_on_offer(self):
+        self.assertIn("LDAC", self.link.state["codecs"])
+        sonyhp.apply_setting(self.link, "priority", "connection")
+        self.assertEqual(self.link.state["priority"], "connection")
+        self.assertNotIn("LDAC", self.link.state["codecs"])
+        self.assertEqual(self.link.state["a2dp_codec"], "SBC-XQ")
+        self.assertEqual(self.link.state["codec"], "SBC")
+        sonyhp.apply_setting(self.link, "priority", "sound-quality")
+        self.assertIn("LDAC", self.link.state["codecs"])
+
+    def test_codec(self):
+        sonyhp.apply_setting(self.link, "codec", "SBC-XQ")
+        self.assertEqual(self.link.state["a2dp_codec"], "SBC-XQ")
+        self.assertEqual(self.link.state["codec"], "SBC", "the headphones are asked, since they do not say")
+        with self.assertRaises(ValueError):
+            sonyhp.apply_setting(self.link, "codec", "aptX")
+
+    def test_the_touch_panel_turns_off_once_confirmed(self):
+        sonyhp.apply_setting(self.link, "touch-sensor", "off")
+        self.assertIs(self.link.state["touch_sensor"], False)
+        sonyhp.apply_setting(self.link, "touch-sensor", "on")
+        self.assertIs(self.link.state["touch_sensor"], True)
+
+    def test_without_the_confirmation_the_touch_panel_stays_on(self):
+        self.link.write(*sonyhp.req(bytes.fromhex("d8 d1 00 01")))
+        self.assertIs(self.link.state["touch_sensor"], True)
+
+
+# -- The codec, via PipeWire ------------------------------------------------------
+
+def pipewire_card(active="a2dp-sink", address="AC:80:0A:57:32:9D", **extra_profiles):
+    profiles = {
+        "off": {"description": "Off", "available": True},
+        "a2dp-sink-sbc": {"description": "High Fidelity Playback (A2DP Sink, codec SBC)", "available": True},
+        "a2dp-sink-sbc_xq": {"description": "High Fidelity Playback (A2DP Sink, codec SBC-XQ)", "available": True},
+        "a2dp-sink": {"description": "High Fidelity Playback (A2DP Sink, codec LDAC)", "available": True},
+        "headset-head-unit": {"description": "Headset Head Unit (HSP/HFP, codec MSBC)", "available": True},
+    }
+    profiles.update(extra_profiles)
+    return {"name": "bluez_card." + address.replace(":", "_"), "active_profile": active,
+            "properties": {"api.bluez5.address": address}, "profiles": profiles}
+
+
+class TestPipeWireCodecs(unittest.TestCase):
+    ADDRESS = "AC:80:0A:57:32:9D"
+
+    def cards(self, *cards):
+        return mock.patch.object(sonyhp, "pactl", return_value=json.dumps(list(cards)))
+
+    def test_codecs_come_from_the_playback_profiles_best_first(self):
+        with self.cards(pipewire_card()):
+            self.assertEqual(sonyhp.audio_codecs(self.ADDRESS), {"codecs": ["LDAC", "SBC-XQ", "SBC"], "a2dp_codec": "LDAC"})
+
+    def test_the_card_is_matched_by_address(self):
+        with self.cards(pipewire_card(address="2C:FD:B4:49:3D:DF")):
+            self.assertEqual(sonyhp.audio_codecs(self.ADDRESS), {"codecs": [], "a2dp_codec": None})
+
+    def test_unavailable_and_headset_profiles_are_left_out(self):
+        card = pipewire_card(**{"a2dp-sink-aac": {"description": "(A2DP Sink, codec AAC)", "available": False}})
+        with self.cards(card):
+            self.assertNotIn("AAC", sonyhp.audio_codecs(self.ADDRESS)["codecs"])
+            self.assertNotIn("MSBC", sonyhp.audio_codecs(self.ADDRESS)["codecs"])
+
+    def test_anything_unreadable_means_no_codecs(self):
+        for output in (None, "", "not json", "{}", "[1, 2]"):
+            with mock.patch.object(sonyhp, "pactl", return_value=output):
+                self.assertEqual(sonyhp.audio_codecs(self.ADDRESS)["codecs"], [], output)
+
+    def test_switching_picks_the_profile_by_codec(self):
+        calls = []
+        cards = [pipewire_card(), pipewire_card(active="a2dp-sink-sbc_xq")]
+
+        def pactl(*args, **kwargs):
+            calls.append(args)
+            if args[0] == "set-card-profile":
+                return ""
+            return json.dumps([cards.pop(0) if len(cards) > 1 else cards[0]])
+
+        with mock.patch.object(sonyhp, "pactl", side_effect=pactl):
+            sonyhp.switch_codec(self.ADDRESS, "SBC-XQ", sleep=lambda _: None)
+        self.assertIn(("set-card-profile", "bluez_card.AC_80_0A_57_32_9D", "a2dp-sink-sbc_xq"), calls)
+
+    def test_a_switch_that_does_not_take_is_an_error(self):
+        # PipeWire accepts the request and then fails it in its log, as it does
+        # when another device already holds the codec's endpoint.
+        clock = FakeClock()
+        with mock.patch.object(sonyhp, "pactl", side_effect=lambda *a, **k: "" if a[0] == "set-card-profile"
+                               else json.dumps([pipewire_card()])):
+            with self.assertRaises(ValueError):
+                sonyhp.switch_codec(self.ADDRESS, "SBC", clock=clock,
+                                    sleep=lambda seconds: setattr(clock, "now", clock.now + seconds))
+
+    def test_a_codec_not_on_offer_is_refused_without_asking_pipewire(self):
+        with self.cards(pipewire_card()) as pactl:
+            with self.assertRaises(ValueError):
+                sonyhp.switch_codec(self.ADDRESS, "aptX")
+        self.assertTrue(all(call.args[0] != "set-card-profile" for call in pactl.call_args_list))
+
+    def test_pactl_runs_by_absolute_path_with_a_minimal_environment(self):
+        with mock.patch.object(sonyhp, "PACTL", "/usr/bin/pactl"), \
+                mock.patch.object(sonyhp.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout="[]", returncode=0)
+            sonyhp.pactl("list", "cards")
+        argv, kwargs = run.call_args
+        self.assertEqual(argv[0][0], "/usr/bin/pactl")
+        self.assertLessEqual(set(kwargs["env"]), {"PATH", "LC_ALL", "XDG_RUNTIME_DIR"})
+
+
+class TestPrioritySettle(unittest.TestCase):
+    """What happens on the computer's side after the priority changes."""
+
+    def run_settle(self, codec_reads, codecs_before=("LDAC", "SBC-XQ", "SBC")):
+        link = sonyhp.Link("AC:80:0A:57:32:9D")
+        link.state.update(protocol=2)
+        reads = list(codec_reads)
+        link.read_audio_codecs = lambda: link.state.update(codecs=reads.pop(0) if len(reads) > 1 else reads[0])
+        link.pump = lambda timeout: clock.update(now=clock["now"] + timeout)
+        link.request = lambda requests, settle=0.25: None
+        clock = {"now": 0.0}
+        with mock.patch.object(sonyhp.time, "monotonic", side_effect=lambda: clock["now"]), \
+                mock.patch.object(sonyhp, "reconnect_audio") as reconnect:
+            sonyhp.settle_priority(link, list(codecs_before))
+        return reconnect, link.state["codecs"]
+
+    def test_headphones_that_renegotiate_are_left_to_it(self):
+        reconnect, codecs = self.run_settle([[], [], [], ["SBC"]])
+        reconnect.assert_not_called()
+        self.assertEqual(codecs, ["SBC"])
+
+    def test_headphones_that_do_not_get_the_audio_profile_reconnected(self):
+        stale = ["SBC-XQ", "SBC"]
+        reconnect, codecs = self.run_settle([stale] * 8 + [["LDAC", "SBC-XQ", "SBC"]], codecs_before=stale)
+        reconnect.assert_called_once()
+        self.assertEqual(codecs, ["LDAC", "SBC-XQ", "SBC"])
+
+    def test_without_audio_there_is_nothing_to_wait_for(self):
+        reconnect, codecs = self.run_settle([[]], codecs_before=())
+        reconnect.assert_not_called()
+        self.assertEqual(codecs, [])
 
 
 class TestRuntimeDirectory(unittest.TestCase):

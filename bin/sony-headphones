@@ -7,7 +7,9 @@
 # The v1 ("MDR") wire protocol implemented here — payload opcodes, byte layouts
 # and their meaning — was reverse engineered by the Gadgetbridge project
 # (AGPL-3.0-or-later), with the message framing cross-checked against
-# SonyHeadphonesClient (MIT). See README.md for the full attribution.
+# SonyHeadphonesClient (MIT). The v2 layouts follow Sony's own message
+# definitions as recovered by mos9527's SonyHeadphonesClient (MIT), checked
+# against Gadgetbridge. See README.md for the full attribution.
 #
 # Speaks Sony's RFCOMM protocol directly: no PyBluez, no D-Bus bindings, no
 # vendor app. Everything below is Python's standard library plus bluetoothctl,
@@ -51,8 +53,11 @@ MSG_COMMAND_2 = 0x0E
 
 MAX_MESSAGE_SIZE = 2048
 
-# Sony's app SPP service. Used to recognise a device that speaks this protocol.
+# Sony's app SPP services, used to recognise a device that speaks this protocol.
+# Models up to the WH-1000XM4 advertise the first; the WH-1000XM5 advertises
+# only the second, and a device that offers both is reached on the newer one.
 SERVICE_UUID = "96cc203e-5068-46ad-b32d-e316f5e069ba"
+SERVICE_UUID_V2 = "956c7b26-d49a-4ba8-b03f-b17d393cb6e2"
 
 
 class ProtocolError(Exception):
@@ -224,8 +229,8 @@ AUDIO_CODECS = {0x00: "unknown", 0x01: "SBC", 0x02: "AAC", 0x10: "LDAC", 0x20: "
 # auto-power-off timer.
 FEATURE_SETS = {
     "WH-1000XM4": {
-        "battery", "equalizer", "dsee", "speak-to-chat", "pause-when-taken-off",
-        "voice-notifications", "auto-power-off", "nc-optimizer",
+        "battery", "equalizer", "dsee", "speak-to-chat", "speak-to-chat-voice-focus",
+        "pause-when-taken-off", "voice-notifications", "auto-power-off", "nc-optimizer",
     },
     "WH-1000XM3": {
         "battery", "equalizer", "dsee", "touch-sensor", "voice-notifications",
@@ -237,7 +242,8 @@ FEATURE_SETS = {
 }
 
 # An unrecognised v1 device gets everything: better to offer a control that
-# turns out to do nothing than to hide one that would have worked.
+# turns out to do nothing than to hide one that would have worked. A v2 device
+# needs no table at all — it lists what it supports; see v2_features().
 ALL_FEATURES = set().union(*FEATURE_SETS.values()) | {"touch-sensor", "auto-power-off-timer"}
 
 
@@ -262,8 +268,10 @@ def req(payload: bytes, msg_type: int = MSG_COMMAND_1) -> tuple[int, bytes]:
     return msg_type, payload
 
 
-def refresh_requests() -> list[tuple[int, bytes]]:
+def refresh_requests(state: dict | None = None) -> list[tuple[int, bytes]]:
     """Everything worth asking for after a connect, in display order."""
+    if is_v2(state):
+        return v2_refresh_requests(state)
     return [
         req(bytes([FW_VERSION_REQUEST, 0x02])),
         req(bytes([CODEC_GET, 0x00])),
@@ -279,6 +287,25 @@ def refresh_requests() -> list[tuple[int, bytes]]:
         req(bytes([NC_OPTIMIZER_STATE_GET, 0x01])),
         req(bytes([VOICE_NOTIFICATIONS_GET, 0x01, 0x01]), MSG_COMMAND_2),
     ]
+
+
+def battery_requests(state: dict | None = None) -> list[tuple[int, bytes]]:
+    """What the daemon's periodic poll asks, to find out the link is alive."""
+    if is_v2(state):
+        return v2_battery_requests(state) or [req(bytes([FW_VERSION_REQUEST, 0x02]))]
+    return [req(bytes([BATTERY_GET, BATTERY_SINGLE]))]
+
+
+def codec_requests(state: dict | None = None) -> list[tuple[int, bytes]]:
+    if is_v2(state):
+        return [req(bytes([V2_CODEC_GET, 0x02]))]
+    return [req(bytes([CODEC_GET, 0x00]))]
+
+
+def power_off_request(state: dict | None = None) -> tuple[int, bytes]:
+    if is_v2(state):
+        return req(bytes([V2_POWER_OFF, 0x03, 0x01]))
+    return req(bytes([POWER_OFF, 0x00]))
 
 
 def asc_request(mode: str, level: int, focus_on_voice: bool, supports_wind: bool) -> tuple[int, bytes]:
@@ -308,20 +335,26 @@ def asc_request(mode: str, level: int, focus_on_voice: bool, supports_wind: bool
     return req(bytes(payload))
 
 
-def eq_preset_request(preset: str) -> tuple[int, bytes]:
+# v1 addresses the equalizer as category 0x01 and asks for a custom curve with
+# preset 0xff; v2 uses category 0x00 and names the curve's own preset, 0xa0.
+EQ_V1 = (0x01, 0xFF)
+EQ_V2 = (0x00, EQ_PRESETS["manual"])
+
+
+def eq_preset_request(preset: str, dialect: tuple[int, int] = EQ_V1) -> tuple[int, bytes]:
     if preset not in EQ_PRESETS:
         raise ValueError(f"unknown equalizer preset {preset!r}")
-    return req(bytes([EQUALIZER_SET, 0x01, EQ_PRESETS[preset], 0x00]))
+    return req(bytes([EQUALIZER_SET, dialect[0], EQ_PRESETS[preset], 0x00]))
 
 
-def eq_bands_request(bass: int, bands: list[int]) -> tuple[int, bytes]:
+def eq_bands_request(bass: int, bands: list[int], dialect: tuple[int, int] = EQ_V1) -> tuple[int, bytes]:
     if len(bands) != 5:
         raise ValueError("expected 5 equalizer bands")
     values = [bass] + list(bands)
     for value in values:
         if value < -10 or value > 10:
             raise ValueError("equalizer values must be between -10 and 10")
-    return req(bytes([EQUALIZER_SET, 0x01, 0xFF, 0x06] + [v + 10 for v in values]))
+    return req(bytes([EQUALIZER_SET, dialect[0], dialect[1], 0x06] + [v + 10 for v in values]))
 
 
 def bool_request(opcode: int, sub: int, spacer: int, enabled: bool) -> tuple[int, bytes]:
@@ -385,9 +418,25 @@ def initial_state() -> dict:
         "touch_sensor": None,
         "voice_notifications": None,
         "nc_optimizer_pressure": None,
+        "priority": None,
+        # From PipeWire rather than the headphones: the codecs it can switch
+        # to, and the one it is using — which, unlike `codec`, tells SBC-XQ
+        # from SBC.
+        "codecs": [],
+        "a2dp_codec": None,
         "features": sorted(ALL_FEATURES),
+        # What the device said about itself: the protocol version from the init
+        # reply and, on v2, its support-function lists and which numbered
+        # general-setting slot is the touch panel.
+        "protocol": None,
+        "functions": None,
+        "touch_slot": None,
         "error": None,
     }
+
+
+def is_v2(state: dict | None) -> bool:
+    return bool(state) and state.get("protocol") == 2
 
 
 def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
@@ -399,6 +448,8 @@ def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
     """
     if not payload:
         return False
+    if is_v2(state):
+        return apply_payload_v2(state, msg_type, payload)
 
     before = dict(state)
     code = payload[0]
@@ -480,6 +531,367 @@ def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Protocol v2 (WH-1000XM5 and later)
+# ---------------------------------------------------------------------------
+#
+# The framing, the init request and the lock-step acknowledgements are v1's;
+# the payloads are not. Most commands moved to new opcodes or sub-types, and
+# most on/off bytes are inverted: 0x00 means on. The init reply grows to eight
+# bytes, which is how a v2 device is told apart.
+#
+# A v2 device also says what it supports. Two support-function lists, one per
+# message type, take the place of v1's per-model feature table: a request is
+# only sent for a function the device listed, and only listed functions become
+# controls. Every layout a WH-1000XM5 uses was verified on one running firmware
+# 2.5.1; the battery-with-threshold variant comes from Sony's definitions alone.
+
+SUPPORT_GET = 0x06
+SUPPORT_RET = 0x07
+V2_CODEC_GET = 0x12
+V2_CODEC_RET = 0x13
+V2_CODEC_NOTIFY = 0x15
+V2_BATTERY_GET = 0x22
+V2_BATTERY_RET = 0x23
+V2_POWER_OFF = 0x24
+V2_BATTERY_NOTIFY = 0x25
+V2_POWER_PARAM_GET = 0x26
+V2_POWER_PARAM_RET = 0x27
+V2_POWER_PARAM_SET = 0x28
+V2_POWER_PARAM_NOTIFY = 0x29
+ALERT_SET_STATUS = 0x94
+ALERT_SET_PARAM = 0x98
+ALERT_NOTIFY = 0x99
+SETTING_CAPABILITY_GET = 0xD0
+SETTING_CAPABILITY_RET = 0xD1
+# These families keep their v1 opcodes and change only the sub-type: what v1
+# calls the touch sensor is v2's general settings, upsampling is its audio
+# family, and the auto-power-off family is its system family.
+SETTING_GET, SETTING_RET, SETTING_SET, SETTING_NOTIFY = TOUCH_GET, TOUCH_RET, TOUCH_SET, TOUCH_NOTIFY
+AUDIO_GET, AUDIO_RET, AUDIO_SET, AUDIO_NOTIFY = UPSAMPLING_GET, UPSAMPLING_RET, UPSAMPLING_SET, UPSAMPLING_NOTIFY
+SYSTEM_GET, SYSTEM_RET, SYSTEM_SET, SYSTEM_NOTIFY = APO_GET, APO_RET, APO_SET, APO_NOTIFY
+SYSTEM_EXT_GET, SYSTEM_EXT_RET, SYSTEM_EXT_SET, SYSTEM_EXT_NOTIFY = (
+    STC_CONFIG_GET, STC_CONFIG_RET, STC_CONFIG_SET, STC_CONFIG_NOTIFY)
+
+V2_BATTERY = 0x00
+V2_BATTERY_WITH_THRESHOLD = 0x08
+V2_AUTO_POWER_OFF = 0x05           # the variant that knows about wear detection
+V2_ASC_DUAL = 0x17                 # NC and ambient, with level and voice focus
+V2_UPSCALING = 0x01
+V2_CONNECTION_MODE = 0x00
+V2_SYSTEM_PAUSE_WHEN_TAKEN_OFF = 0x01
+V2_SYSTEM_SPEAK_TO_CHAT = 0x0C
+V2_VOICE_GUIDANCE = 0x01
+ALERT_FIXED_MESSAGE = 0x00
+# Turning the touch panel off is a change the headphones want confirmed; the
+# second variant warns that they may drop the connection to apply it.
+ALERT_TOUCH_PANEL_OFF = 0x0A
+ALERT_TOUCH_PANEL_OFF_RECONNECT = 0x0B
+TOUCH_PANEL_SETTING = b"TOUCH_PANEL_SETTING"
+
+# Support-function codes, as the device lists them.
+FN_CODEC = 0x12
+FN_BATTERY = 0x20
+FN_BATTERY_WITH_THRESHOLD = 0x28
+FN_AUTO_POWER_OFF = 0x25
+FN_EQUALIZER = 0x50
+FN_ASC_DUAL = 0x6B
+FN_ALERTS = 0x90
+FN_GENERAL_SETTINGS = (0xD1, 0xD2, 0xD3, 0xD4)
+FN_CONNECTION_MODE = 0xE1
+FN_UPSCALING = 0xE2
+FN_PAUSE_WHEN_TAKEN_OFF = 0xF1
+FN_SPEAK_TO_CHAT = 0xFC
+FN2_VOICE_GUIDANCE = 0x41
+
+V2_FEATURES = {
+    "table1": {
+        FN_BATTERY: "battery",
+        FN_BATTERY_WITH_THRESHOLD: "battery",
+        FN_EQUALIZER: "equalizer",
+        FN_UPSCALING: "dsee",
+        FN_CONNECTION_MODE: "connection-priority",
+        FN_SPEAK_TO_CHAT: "speak-to-chat",
+        FN_PAUSE_WHEN_TAKEN_OFF: "pause-when-taken-off",
+        FN_AUTO_POWER_OFF: "auto-power-off",
+    },
+    "table2": {
+        FN2_VOICE_GUIDANCE: "voice-notifications",
+    },
+}
+
+# The timers exist in the protocol, but a WH-1000XM5 answers "when taken off"
+# to every one of them, so none is offered.
+V2_AUTO_POWER_OFF_CODES = {
+    "off": 0x11,
+    "when-taken-off": 0x10,
+    "5-min": 0x00,
+    "30-min": 0x01,
+    "1-hour": 0x02,
+    "3-hour": 0x03,
+}
+V2_AUTO_POWER_OFF_FROM_CODE = {v: k for k, v in V2_AUTO_POWER_OFF_CODES.items()}
+
+# Sound quality or a stable connection. Preferring the connection rules out
+# LDAC, and the headphones renegotiate the audio link to apply it.
+PRIORITY = {"sound-quality": 0x00, "connection": 0x01}
+PRIORITY_FROM_CODE = {v: k for k, v in PRIORITY.items()}
+
+
+def _on(value: int):
+    """v2's inverted on/off byte."""
+    return {0x00: True, 0x01: False}.get(value)
+
+
+def _off_byte(enabled: bool) -> int:
+    return 0x00 if enabled else 0x01
+
+
+def v2_functions(state: dict, table: str) -> set:
+    return set((state.get("functions") or {}).get(table) or ())
+
+
+def v2_features(state: dict) -> list:
+    features = set()
+    for table, names in V2_FEATURES.items():
+        listed = v2_functions(state, table)
+        features |= {name for code, name in names.items() if code in listed}
+    if state.get("touch_slot") is not None:
+        features.add("touch-sensor")
+    return sorted(features)
+
+
+def v2_discovery_requests() -> list[tuple[int, bytes]]:
+    """What the device supports, one list per message type."""
+    return [req(bytes([SUPPORT_GET, 0x00])), req(bytes([SUPPORT_GET, 0x00]), MSG_COMMAND_2)]
+
+
+def v2_capability_requests(state: dict) -> list[tuple[int, bytes]]:
+    """General settings are numbered slots whose meaning varies by model, so
+    each one is asked what it is — only the touch panel is of use here."""
+    listed = v2_functions(state, "table1")
+    return [req(bytes([SETTING_CAPABILITY_GET, slot, 0x00])) for slot in FN_GENERAL_SETTINGS if slot in listed]
+
+
+def v2_battery_requests(state: dict) -> list[tuple[int, bytes]]:
+    listed = v2_functions(state, "table1")
+    if FN_BATTERY in listed:
+        return [req(bytes([V2_BATTERY_GET, V2_BATTERY]))]
+    if FN_BATTERY_WITH_THRESHOLD in listed:
+        return [req(bytes([V2_BATTERY_GET, V2_BATTERY_WITH_THRESHOLD]))]
+    return []
+
+
+def v2_refresh_requests(state: dict) -> list[tuple[int, bytes]]:
+    table1 = v2_functions(state, "table1")
+    table2 = v2_functions(state, "table2")
+    wanted = [
+        (True, req(bytes([FW_VERSION_REQUEST, 0x02]))),
+        (FN_CODEC in table1, req(bytes([V2_CODEC_GET, 0x02]))),
+        (FN_ASC_DUAL in table1, req(bytes([ASC_GET, V2_ASC_DUAL]))),
+        (FN_EQUALIZER in table1, req(bytes([EQUALIZER_GET, 0x00]))),
+        (FN_UPSCALING in table1, req(bytes([AUDIO_GET, V2_UPSCALING]))),
+        (FN_CONNECTION_MODE in table1, req(bytes([AUDIO_GET, V2_CONNECTION_MODE]))),
+        (FN_SPEAK_TO_CHAT in table1, req(bytes([SYSTEM_GET, V2_SYSTEM_SPEAK_TO_CHAT]))),
+        (FN_SPEAK_TO_CHAT in table1, req(bytes([SYSTEM_EXT_GET, V2_SYSTEM_SPEAK_TO_CHAT]))),
+        (FN_PAUSE_WHEN_TAKEN_OFF in table1, req(bytes([SYSTEM_GET, V2_SYSTEM_PAUSE_WHEN_TAKEN_OFF]))),
+        (FN_AUTO_POWER_OFF in table1, req(bytes([V2_POWER_PARAM_GET, V2_AUTO_POWER_OFF]))),
+        (state.get("touch_slot") is not None, req(bytes([SETTING_GET, state.get("touch_slot") or 0]))),
+        (FN2_VOICE_GUIDANCE in table2, req(bytes([VOICE_NOTIFICATIONS_GET, V2_VOICE_GUIDANCE]), MSG_COMMAND_2)),
+    ]
+    return [request for include, request in wanted if include] + v2_battery_requests(state)
+
+
+def v2_asc_request(mode: str, level: int, focus_on_voice: bool) -> tuple[int, bytes]:
+    if mode not in NC_MODES:
+        raise ValueError(f"unknown mode {mode!r}; expected one of {', '.join(NC_MODES)}")
+    if mode == "wind-noise-reduction":
+        raise ValueError("this device does not support wind noise reduction")
+    level = max(0, min(MAX_AMBIENT_LEVEL, int(level)))
+    return req(bytes([
+        ASC_SET, V2_ASC_DUAL,
+        0x01,                                   # the change is final, not a slider mid-drag
+        0x00 if mode == "off" else 0x01,
+        0x01 if mode == "ambient-sound" else 0x00,
+        0x01 if focus_on_voice else 0x00,
+        level,                                  # kept in every mode, unlike v1
+    ]))
+
+
+def v2_setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
+    table1 = v2_functions(state, "table1")
+
+    if key in ASC_KEYS:
+        if FN_ASC_DUAL not in table1:
+            raise ValueError(f"{state.get('name') or 'this device'} does not support {key} here yet")
+        return [v2_asc_request(*asc_target(state, key, value))]
+
+    if key == "eq":
+        return [eq_preset_request(str(value), EQ_V2)]
+
+    if key == "eq-bands":
+        bass, bands = parse_eq_bands(value)
+        return [eq_bands_request(bass, bands, EQ_V2)]
+
+    if key == "auto-power-off":
+        code = V2_AUTO_POWER_OFF_CODES.get(str(value))
+        if code is None:
+            raise ValueError(f"unknown auto power off value {value!r}")
+        return [req(bytes([V2_POWER_PARAM_SET, V2_AUTO_POWER_OFF, code, 0x00]))]
+
+    if key in ("stc-sensitivity", "stc-timeout"):
+        sensitivity = state.get("stc_sensitivity") or "auto"
+        timeout = state.get("stc_timeout") or "standard"
+        if key == "stc-sensitivity":
+            sensitivity = str(value)
+        else:
+            timeout = str(value)
+        if sensitivity not in STC_SENSITIVITY:
+            raise ValueError(f"unknown speak-to-chat sensitivity {sensitivity!r}")
+        if timeout not in STC_TIMEOUT:
+            raise ValueError(f"unknown speak-to-chat timeout {timeout!r}")
+        return [req(bytes([SYSTEM_EXT_SET, V2_SYSTEM_SPEAK_TO_CHAT,
+                           STC_SENSITIVITY[sensitivity], STC_TIMEOUT[timeout]]))]
+
+    if key == "speak-to-chat":
+        enabled = parse_bool(value, state.get("speak_to_chat"))
+        # The trailing byte is the preview mode, left off as Sony's app does.
+        return [req(bytes([SYSTEM_SET, V2_SYSTEM_SPEAK_TO_CHAT, _off_byte(enabled), 0x01]))]
+
+    if key == "pause-when-taken-off":
+        enabled = parse_bool(value, state.get("pause_when_taken_off"))
+        return [req(bytes([SYSTEM_SET, V2_SYSTEM_PAUSE_WHEN_TAKEN_OFF, _off_byte(enabled)]))]
+
+    if key == "dsee":
+        # Not inverted: this byte picks between "off" and "auto".
+        enabled = parse_bool(value, state.get("dsee"))
+        return [req(bytes([AUDIO_SET, V2_UPSCALING, 0x01 if enabled else 0x00]))]
+
+    if key == "voice-notifications":
+        enabled = parse_bool(value, state.get("voice_notifications"))
+        return [req(bytes([VOICE_NOTIFICATIONS_SET, V2_VOICE_GUIDANCE, _off_byte(enabled)]), MSG_COMMAND_2)]
+
+    if key == "priority":
+        if str(value) not in PRIORITY:
+            raise ValueError(f"unknown priority {value!r}; expected one of {', '.join(PRIORITY)}")
+        return [req(bytes([AUDIO_SET, V2_CONNECTION_MODE, PRIORITY[str(value)]]))]
+
+    if key == "touch-sensor":
+        enabled = parse_bool(value, state.get("touch_sensor"))
+        change = req(bytes([SETTING_SET, state["touch_slot"], 0x00, _off_byte(enabled)]))
+        if enabled or FN_ALERTS not in table1:
+            return [change]
+        # Switching the panel off is refused unless the headphones can ask for
+        # confirmation first, and they only ask once alerts are enabled.
+        return [req(bytes([ALERT_SET_STATUS, ALERT_FIXED_MESSAGE, 0x00])), change]
+
+    raise ValueError(f"unknown setting {key!r}; expected one of {', '.join(SETTING_KEYS)}")
+
+
+def alert_confirmation(msg_type: int, payload: bytes) -> tuple[int, bytes] | None:
+    """The answer to a touch-panel confirmation the headphones asked for, if
+    this is one. Nothing else they ask about is answered."""
+    if (msg_type == MSG_COMMAND_1 and len(payload) == 4 and payload[0] == ALERT_NOTIFY
+            and payload[1] == ALERT_FIXED_MESSAGE
+            and payload[2] in (ALERT_TOUCH_PANEL_OFF, ALERT_TOUCH_PANEL_OFF_RECONNECT)):
+        return req(bytes([ALERT_SET_PARAM, ALERT_FIXED_MESSAGE, payload[2], 0x01]))
+    return None
+
+
+def apply_payload_v2(state: dict, msg_type: int, payload: bytes) -> bool:
+    before = dict(state)
+    code = payload[0]
+
+    if code == SUPPORT_RET and len(payload) >= 3 and payload[1] == 0x00:
+        count = payload[2]
+        pairs = payload[3:]
+        if len(pairs) == 2 * count:
+            table = "table2" if msg_type == MSG_COMMAND_2 else "table1"
+            functions = dict(state.get("functions") or {})
+            functions[table] = sorted(set(pairs[0::2]))
+            state["functions"] = functions
+            state["features"] = v2_features(state)
+        return state != before
+
+    if msg_type == MSG_COMMAND_2:
+        if (code in (VOICE_NOTIFICATIONS_RET, VOICE_NOTIFICATIONS_NOTIFY) and len(payload) >= 3
+                and payload[1] == V2_VOICE_GUIDANCE):
+            state["voice_notifications"] = _on(payload[2])
+        return state != before
+
+    if code == FW_VERSION_REPLY and len(payload) >= 4 and payload[1] == 0x02:
+        version = payload[3:].decode("ascii", "replace")
+        if re.fullmatch(r"[0-9.\-a-zA-Z_]+", version):
+            state["firmware"] = version
+
+    elif code in (V2_CODEC_RET, V2_CODEC_NOTIFY) and len(payload) == 3 and payload[1] == 0x02:
+        state["codec"] = AUDIO_CODECS.get(payload[2], f"0x{payload[2]:02x}")
+
+    elif (code in (V2_BATTERY_RET, V2_BATTERY_NOTIFY) and len(payload) >= 4
+            and payload[1] in (V2_BATTERY, V2_BATTERY_WITH_THRESHOLD) and payload[2] <= 100):
+        state["battery"] = payload[2]
+        state["charging"] = payload[3] == 0x01
+
+    elif code in (ASC_RET, ASC_NOTIFY) and len(payload) == 7 and payload[1] == V2_ASC_DUAL:
+        mode = "off" if payload[3] == 0x00 else {0x00: "noise-cancelling", 0x01: "ambient-sound"}.get(payload[4])
+        level = payload[6]
+        if mode is not None and 0 <= level <= MAX_AMBIENT_LEVEL:
+            state["supports_wind"] = False
+            state["nc_mode"] = mode
+            state["ambient_level"] = level
+            state["focus_on_voice"] = _bool(payload[5])
+
+    elif (code in (EQUALIZER_RET, EQUALIZER_NOTIFY) and len(payload) == 10
+            and payload[1] == 0x00 and payload[3] == 0x06):
+        preset = EQ_PRESET_FROM_CODE.get(payload[2])
+        if preset is not None:
+            state["eq_preset"] = preset
+            state["eq_bass"] = payload[4] - 10
+            state["eq_bands"] = [payload[5 + i] - 10 for i in range(5)]
+
+    elif code in (AUDIO_RET, AUDIO_NOTIFY) and len(payload) == 3 and payload[1] == V2_UPSCALING:
+        state["dsee"] = _bool(payload[2])
+
+    elif code in (AUDIO_RET, AUDIO_NOTIFY) and len(payload) == 3 and payload[1] == V2_CONNECTION_MODE:
+        priority = PRIORITY_FROM_CODE.get(payload[2])
+        if priority is not None:
+            state["priority"] = priority
+
+    elif code in (SYSTEM_RET, SYSTEM_NOTIFY) and len(payload) >= 3:
+        if payload[1] == V2_SYSTEM_PAUSE_WHEN_TAKEN_OFF and len(payload) == 3:
+            state["pause_when_taken_off"] = _on(payload[2])
+        elif payload[1] == V2_SYSTEM_SPEAK_TO_CHAT and len(payload) == 4:
+            state["speak_to_chat"] = _on(payload[2])
+
+    elif (code in (SYSTEM_EXT_RET, SYSTEM_EXT_NOTIFY) and len(payload) == 4
+            and payload[1] == V2_SYSTEM_SPEAK_TO_CHAT):
+        sensitivity = STC_SENSITIVITY_FROM_CODE.get(payload[2])
+        timeout = STC_TIMEOUT_FROM_CODE.get(payload[3])
+        if sensitivity is not None and timeout is not None:
+            state["stc_sensitivity"] = sensitivity
+            state["stc_timeout"] = timeout
+
+    elif (code in (V2_POWER_PARAM_RET, V2_POWER_PARAM_NOTIFY) and len(payload) == 4
+            and payload[1] == V2_AUTO_POWER_OFF):
+        value = V2_AUTO_POWER_OFF_FROM_CODE.get(payload[2])
+        if value is not None:
+            state["auto_power_off"] = value
+
+    elif code == SETTING_CAPABILITY_RET and len(payload) >= 5 and payload[1] in FN_GENERAL_SETTINGS:
+        # d1 <slot> <type> <?> <name length> <name> …; only a boolean slot
+        # named for the touch panel is taken.
+        name = payload[5:5 + payload[4]]
+        if payload[2] == 0x00 and name == TOUCH_PANEL_SETTING:
+            state["touch_slot"] = payload[1]
+            state["features"] = v2_features(state)
+
+    elif (code in (SETTING_RET, SETTING_NOTIFY) and len(payload) == 4
+            and payload[1] == state.get("touch_slot") and payload[2] == 0x00):
+        state["touch_sensor"] = _on(payload[3])
+
+    return state != before
+
+
+# ---------------------------------------------------------------------------
 # SDP: which RFCOMM channel is the control service on?
 # ---------------------------------------------------------------------------
 #
@@ -494,6 +906,7 @@ SDP_SERVICE_SEARCH_ATTR_REQUEST = 0x06
 SDP_SERVICE_SEARCH_ATTR_RESPONSE = 0x07
 RFCOMM_PROTOCOL_UUID = 0x0003
 SERVICE_UUID_BYTES = bytes.fromhex(SERVICE_UUID.replace("-", ""))
+SERVICE_UUID_V2_BYTES = bytes.fromhex(SERVICE_UUID_V2.replace("-", ""))
 
 # The device decides how long this exchange runs and how much it sends, so both
 # are capped here rather than left to it. A real answer is a few hundred bytes
@@ -703,11 +1116,15 @@ BLUETOOTHCTL_CANDIDATES = ("/usr/bin/bluetoothctl", "/bin/bluetoothctl", "/usr/l
 BLUETOOTHCTL_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
 
 
-def find_bluetoothctl() -> str | None:
-    for candidate in BLUETOOTHCTL_CANDIDATES:
+def find_executable(candidates: tuple[str, ...]) -> str | None:
+    for candidate in candidates:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+def find_bluetoothctl() -> str | None:
+    return find_executable(BLUETOOTHCTL_CANDIDATES)
 
 
 BLUETOOTHCTL = find_bluetoothctl()
@@ -736,9 +1153,11 @@ def connected_devices() -> list[dict]:
             continue
         address = parts[1]
         name = parts[2].strip() if len(parts) > 2 else address
-        info = bluetoothctl("info", address)
-        if SERVICE_UUID in info.lower():
-            devices.append({"address": address, "name": name})
+        info = bluetoothctl("info", address).lower()
+        if SERVICE_UUID_V2 in info:
+            devices.append({"address": address, "name": name, "service": SERVICE_UUID_V2_BYTES})
+        elif SERVICE_UUID in info:
+            devices.append({"address": address, "name": name, "service": SERVICE_UUID_BYTES})
     return devices
 
 
@@ -750,6 +1169,117 @@ def find_device(preferred: str | None = None) -> dict | None:
                 return device
         return None
     return devices[0] if devices else None
+
+
+# ---------------------------------------------------------------------------
+# The audio codec, via PipeWire
+# ---------------------------------------------------------------------------
+#
+# The headphones report the codec but do not choose it: the computer does, and
+# on Omarchy that means PipeWire, which offers one A2DP profile per codec the
+# pair can use. Choosing a codec is choosing the card's profile. What is on
+# offer changes with the headphones' connection priority — a WH-1000XM5 told
+# to prefer a stable connection stops offering LDAC — and profile names shift
+# with it, so the list is read fresh each time and codecs are matched by name.
+
+# pactl is found and run the way bluetoothctl is. It needs the runtime
+# directory to reach PipeWire's socket, and nothing else from the environment.
+PACTL_CANDIDATES = ("/usr/bin/pactl", "/bin/pactl", "/usr/local/bin/pactl")
+PACTL_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+PACTL = find_executable(PACTL_CANDIDATES)
+
+PROFILE_CODEC_RE = re.compile(r"\bcodec ([A-Za-z0-9][A-Za-z0-9 ._+-]*)\)$")
+# Best first, which is how the panel lists them.
+CODEC_ORDER = ("LDAC", "aptX HD", "aptX", "AAC", "LC3", "SBC-XQ", "SBC")
+CODEC_SWITCH_TIMEOUT = 4.0
+
+
+def pactl(*args: str, timeout: float = 3.0) -> str | None:
+    """pactl's output, or None if it is missing, failed, or took too long."""
+    if PACTL is None:
+        return None
+    env = dict(PACTL_ENV)
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and is_private_dir(runtime):
+        env["XDG_RUNTIME_DIR"] = runtime
+    try:
+        done = subprocess.run(
+            [PACTL, *args],
+            check=False, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def bluez_card(address: str) -> dict | None:
+    """PipeWire's card for these headphones, as pactl describes it."""
+    try:
+        cards = json.loads(pactl("--format=json", "list", "cards") or "[]")
+    except ValueError:
+        return None
+    for card in cards if isinstance(cards, list) else []:
+        if not isinstance(card, dict) or not str(card.get("name", "")).startswith("bluez_card."):
+            continue
+        properties = card.get("properties")
+        if isinstance(properties, dict) and str(properties.get("api.bluez5.address", "")).lower() == address.lower():
+            return card
+    return None
+
+
+def a2dp_profiles(card: dict) -> dict[str, str]:
+    """codec -> profile, for the playback profiles the card can switch to now."""
+    found = {}
+    profiles = card.get("profiles")
+    for name, profile in (profiles.items() if isinstance(profiles, dict) else ()):
+        if not str(name).startswith("a2dp-sink") or not isinstance(profile, dict):
+            continue
+        if profile.get("available") is False:
+            continue
+        match = PROFILE_CODEC_RE.search(str(profile.get("description", "")))
+        if match:
+            found.setdefault(match.group(1), str(name))
+    return found
+
+
+def codec_rank(codec: str) -> int:
+    return CODEC_ORDER.index(codec) if codec in CODEC_ORDER else len(CODEC_ORDER)
+
+
+def audio_codecs(address: str) -> dict:
+    """The codecs PipeWire offers for these headphones and the one in use.
+
+    Empty when PipeWire has no card for them — not connected for audio, or no
+    pactl — which hides the control rather than offering one that cannot work.
+    """
+    card = bluez_card(address)
+    if card is None:
+        return {"codecs": [], "a2dp_codec": None}
+    profiles = a2dp_profiles(card)
+    active = card.get("active_profile")
+    return {
+        "codecs": sorted(profiles, key=codec_rank),
+        "a2dp_codec": next((codec for codec, name in profiles.items() if name == active), None),
+    }
+
+
+def switch_codec(address: str, codec: str, clock=time.monotonic, sleep=time.sleep) -> None:
+    card = bluez_card(address)
+    profiles = a2dp_profiles(card) if card else {}
+    if codec not in profiles:
+        offered = ", ".join(sorted(profiles, key=codec_rank)) or "none"
+        raise ValueError(f"{codec} is not on offer for these headphones right now (offered: {offered})")
+    if pactl("set-card-profile", card["name"], profiles[codec]) is None:
+        raise ValueError(f"PipeWire refused to switch to {codec}")
+    # pactl returns before the switch happens, and a switch that fails is only
+    # reported in PipeWire's log, so it counts once the card says so. The usual
+    # failure is another Bluetooth device already streaming with that codec.
+    deadline = clock() + CODEC_SWITCH_TIMEOUT
+    while clock() < deadline:
+        sleep(0.25)
+        if audio_codecs(address)["a2dp_codec"] == codec:
+            return
+    raise ValueError(f"PipeWire could not switch to {codec}; another Bluetooth device may be using it")
 
 
 def _channel_cache_path(address: str) -> str:
@@ -825,6 +1355,10 @@ class NotConnected(Exception):
     pass
 
 
+class Reconnecting(NotConnected):
+    """The headphones dropped the link on purpose, to apply a change."""
+
+
 class Link:
     """One RFCOMM conversation with a pair of headphones.
 
@@ -839,9 +1373,10 @@ class Link:
     # stand-in device answers inside write() itself.
     answers_immediately = False
 
-    def __init__(self, address: str, on_change=None):
+    def __init__(self, address: str, on_change=None, service: bytes = SERVICE_UUID_BYTES):
         self.address = address
         self.on_change = on_change
+        self.service = service
         self.state = initial_state()
         self.state["address"] = address
         self.sock: socket.socket | None = None
@@ -849,6 +1384,19 @@ class Link:
         self._buffer = bytearray()
         self._acked = False
         self.last_rx = 0.0
+        # Answers to send once the current read is done, and whether a
+        # confirmation the headphones asked for may be given (see apply_setting).
+        self._outbox: list[tuple[int, bytes]] = []
+        self.confirm_alerts = False
+        self.expect_drop = False
+
+    @classmethod
+    def for_device(cls, device: dict, on_change=None) -> "Link":
+        link = cls(device["address"], on_change=on_change,
+                   service=device.get("service", SERVICE_UUID_BYTES))
+        link.state["name"] = device["name"]
+        link.state["features"] = features_for(device["name"])
+        return link
 
     # -- connection ---------------------------------------------------------
 
@@ -870,7 +1418,7 @@ class Link:
         unavailable but the channel has not moved.
         """
         candidates = []
-        discovered = sdp_channel(self.address)
+        discovered = sdp_channel(self.address, self.service)
         if discovered:
             candidates.append(discovered)
         known = cached_channel(self.address)
@@ -914,10 +1462,9 @@ class Link:
     def _handshake(self) -> bool:
         """Send INIT and wait for the device to identify itself.
 
-        A four-byte init reply means protocol v1, which is what this plugin
-        speaks. Eight bytes means v2 (WF-1000XM4, XM5, LinkBuds, CH720N…) —
-        a different command set entirely, so say so rather than send v1 bytes
-        at a device that will ignore them.
+        A four-byte init reply means protocol v1 (up to the WH-1000XM4);
+        eight bytes means v2 (WH-1000XM5 and later), a different command set
+        whose features the device lists itself once asked.
 
         The headphones sometimes ignore the first INIT of a session, usually
         just after a previous one closed, so ask again rather than declaring
@@ -938,13 +1485,24 @@ class Link:
                 self._ack(seq)
                 if payload and payload[0] == INIT_REPLY:
                     if len(payload) == 4:
+                        self.state["protocol"] = 1
+                        return True
+                    if len(payload) == 8:
+                        self.use_v2()
                         return True
                     raise NotConnected(
-                        "this device speaks Sony's v2 protocol, which this plugin "
-                        "does not implement yet (v1 devices only: WH-1000XM2/XM3/XM4)"
+                        f"unrecognised init reply {payload.hex(' ')}; "
+                        "this device speaks a Sony protocol this plugin does not know"
                     )
                 self.dispatch(msg_type, payload)
         return False
+
+    def use_v2(self) -> None:
+        # Nothing is offered until the device has said it supports it.
+        self.state["protocol"] = 2
+        self.state["features"] = []
+        self.state["functions"] = None
+        self.state["touch_slot"] = None
 
     def close(self) -> None:
         if self.sock is not None:
@@ -1041,8 +1599,38 @@ class Link:
     # -- conversation -------------------------------------------------------
 
     def dispatch(self, msg_type: int, payload: bytes) -> None:
-        if apply_payload(self.state, msg_type, payload) and self.on_change:
-            self.on_change(self.state)
+        if self.confirm_alerts:
+            answer = alert_confirmation(msg_type, payload)
+            if answer is not None:
+                self._outbox.append(answer)
+                if payload[2] == ALERT_TOUCH_PANEL_OFF_RECONNECT:
+                    self.expect_drop = True
+        codec = self.state.get("codec")
+        if apply_payload(self.state, msg_type, payload):
+            # A new codec means the audio link was renegotiated, and what
+            # PipeWire offers may have changed with it.
+            if self.state.get("codec") != codec:
+                self.read_audio_codecs()
+            if self.on_change:
+                self.on_change(self.state)
+
+    def read_audio_codecs(self) -> None:
+        self.state.update(audio_codecs(self.address))
+
+    def select_codec(self, codec: str) -> None:
+        try:
+            switch_codec(self.address, codec)
+        finally:
+            self.read_audio_codecs()
+        # The headphones do not announce a codec PipeWire switched them to.
+        self.request(codec_requests(self.state))
+
+    def _flush(self) -> None:
+        """Send what dispatch() queued. Not from inside dispatch itself, which
+        can run while a write is still waiting for its acknowledgement."""
+        while self._outbox:
+            msg_type, payload = self._outbox.pop(0)
+            self.write(msg_type, payload)
 
     def pump(self, timeout: float) -> None:
         """Read and process whatever the headphones have to say for a while."""
@@ -1060,6 +1648,7 @@ class Link:
                 continue
             self._ack(seq)
             self.dispatch(msg_type, payload)
+            self._flush()
 
     def request(self, requests: list[tuple[int, bytes]], settle: float = 0.25) -> None:
         for msg_type, payload in requests:
@@ -1067,7 +1656,13 @@ class Link:
         self.pump(settle)
 
     def refresh(self) -> dict:
-        self.request(refresh_requests(), settle=0.6)
+        if is_v2(self.state) and self.state.get("functions") is None:
+            # Each step needs the answers to the one before: what the device
+            # supports, then what its numbered setting slots are.
+            self.request(v2_discovery_requests(), settle=0.6)
+            self.request(v2_capability_requests(self.state), settle=0.6)
+        self.request(refresh_requests(self.state), settle=0.6)
+        self.read_audio_codecs()
         return self.state
 
 
@@ -1086,6 +1681,7 @@ BOOL_SETTINGS = {
 SETTING_KEYS = sorted(list(BOOL_SETTINGS) + [
     "nc", "ambient-level", "focus-on-voice", "eq", "eq-bands", "auto-power-off",
     "stc-sensitivity", "stc-timeout", "stc-focus-on-voice", "voice-notifications",
+    "priority", "codec",
 ])
 
 
@@ -1117,17 +1713,49 @@ SETTING_FEATURES = {
     "speak-to-chat": "speak-to-chat",
     "stc-sensitivity": "speak-to-chat",
     "stc-timeout": "speak-to-chat",
-    "stc-focus-on-voice": "speak-to-chat",
+    "stc-focus-on-voice": "speak-to-chat-voice-focus",
     "pause-when-taken-off": "pause-when-taken-off",
     "touch-sensor": "touch-sensor",
     "voice-notifications": "voice-notifications",
     "auto-power-off": "auto-power-off",
+    "priority": "connection-priority",
 }
+
+
+ASC_KEYS = ("nc", "ambient-level", "focus-on-voice")
+
+
+def asc_target(state: dict, key: str, value) -> tuple[str, int, bool]:
+    """The mode, ambient level and voice focus a change to one of them asks for."""
+    mode = state.get("nc_mode") or "off"
+    level = state.get("ambient_level")
+    level = MAX_AMBIENT_LEVEL if level is None else level
+    focus = bool(state.get("focus_on_voice"))
+
+    if key == "nc":
+        mode = next_nc_mode(mode) if str(value) == "cycle" else str(value)
+    elif key == "ambient-level":
+        level = int(value)
+        # Adjusting the slider is how you ask for ambient sound; jumping there
+        # matches what the phone app does and avoids a silent no-op in NC mode.
+        if mode not in ("ambient-sound", "off"):
+            mode = "ambient-sound"
+    else:
+        focus = parse_bool(value, focus)
+    return mode, level, focus
+
+
+def parse_eq_bands(value) -> tuple[int, list[int]]:
+    numbers = [int(v) for v in re.split(r"[,\s]+", str(value).strip()) if v]
+    if len(numbers) != 6:
+        raise ValueError("eq-bands takes 6 values: clear-bass and 5 bands, each -10..10")
+    return numbers[0], numbers[1:]
 
 
 def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
     """Turn one setting change into the requests that carry it."""
-    features = state.get("features") or sorted(ALL_FEATURES)
+    features = state.get("features")
+    features = sorted(ALL_FEATURES) if features is None else features
     needed = SETTING_FEATURES.get(key)
     if needed and needed not in features:
         raise ValueError(f"{state.get('name') or 'this device'} does not support {key}")
@@ -1137,36 +1765,23 @@ def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
             f"{state.get('name') or 'this device'} only supports auto power off "
             "'off' or 'when-taken-off'"
         )
+    if is_v2(state):
+        return v2_setting_requests(state, key, value)
+    return setting_requests_v1(state, key, value)
+
+
+def setting_requests_v1(state: dict, key: str, value) -> list[tuple[int, bytes]]:
     supports_wind = state.get("supports_wind")
     supports_wind = True if supports_wind is None else supports_wind
-    mode = state.get("nc_mode") or "off"
-    level = state.get("ambient_level")
-    level = MAX_AMBIENT_LEVEL if level is None else level
-    focus = bool(state.get("focus_on_voice"))
 
-    if key == "nc":
-        mode = next_nc_mode(mode) if str(value) == "cycle" else str(value)
-        return [asc_request(mode, level, focus, supports_wind)]
-
-    if key == "ambient-level":
-        level = int(value)
-        # Adjusting the slider is how you ask for ambient sound; jumping there
-        # matches what the phone app does and avoids a silent no-op in NC mode.
-        if mode not in ("ambient-sound", "off"):
-            mode = "ambient-sound"
-        return [asc_request(mode, level, focus, supports_wind)]
-
-    if key == "focus-on-voice":
-        return [asc_request(mode, level, parse_bool(value, focus), supports_wind)]
+    if key in ASC_KEYS:
+        return [asc_request(*asc_target(state, key, value), supports_wind)]
 
     if key == "eq":
         return [eq_preset_request(str(value))]
 
     if key == "eq-bands":
-        numbers = [int(v) for v in re.split(r"[,\s]+", str(value).strip()) if v]
-        if len(numbers) != 6:
-            raise ValueError("eq-bands takes 6 values: clear-bass and 5 bands, each -10..10")
-        return [eq_bands_request(numbers[0], numbers[1:])]
+        return [eq_bands_request(*parse_eq_bands(value))]
 
     if key == "auto-power-off":
         return [auto_power_off_request(str(value))]
@@ -1197,22 +1812,96 @@ def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
 SETTLE_TIMEOUT = 2.0
 
 
+# A new priority can take the audio link down for seven seconds or more, and
+# reconnecting it ourselves costs a few more.
+PRIORITY_SETTLE_TIMEOUT = 15.0
+PRIORITY_RENEGOTIATION_GRACE = 3.0
+AUDIO_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+
+
 def apply_setting(link: Link, key: str, value) -> dict:
+    if key == "codec":
+        # Not a headphone setting at all: PipeWire's.
+        link.select_codec(str(value))
+        return link.state
+
     requests = setting_requests(link.state, key, value)
     before = dict(link.state)
-    for msg_type, payload in requests:
-        link.write(msg_type, payload)
+    # A change that turned alerts on is one the headphones will ask to have
+    # confirmed; asking for it was the confirmation, so the question that
+    # follows is answered yes. Nothing else they ask is answered.
+    link.confirm_alerts = any(p[0] == ALERT_SET_STATUS for t, p in requests if t == MSG_COMMAND_1)
+    link.expect_drop = False
+    try:
+        for msg_type, payload in requests:
+            link.write(msg_type, payload)
 
-    # The headphones echo every change back as a notification, so wait for the
-    # echo rather than a fixed interval: it usually lands in milliseconds, but
-    # after a burst of writes a WH-1000XM4 can take the better part of a second,
-    # and returning before it arrives reports the old value as the new one.
-    deadline = time.monotonic() + (0 if link.answers_immediately else SETTLE_TIMEOUT)
-    while time.monotonic() < deadline:
-        link.pump(0.15)
-        if link.state != before:
-            break
+        # The headphones echo every change back as a notification, so wait for
+        # the echo rather than a fixed interval: it usually lands in
+        # milliseconds, but after a burst of writes a WH-1000XM4 can take the
+        # better part of a second, and returning before it arrives reports the
+        # old value as the new one.
+        deadline = time.monotonic() + (0 if link.answers_immediately else SETTLE_TIMEOUT)
+        while time.monotonic() < deadline:
+            link.pump(0.15)
+            if link.state != before:
+                break
+    except (NotConnected, OSError):
+        if link.expect_drop:
+            raise Reconnecting(f"the headphones are reconnecting to apply {key}") from None
+        raise
+    finally:
+        link.confirm_alerts = False
+
+    if key == "priority" and link.state.get("priority") != before.get("priority"):
+        settle_priority(link, before.get("codecs") or [])
     return link.state
+
+
+def settle_priority(link: Link, codecs_before: list) -> None:
+    """See a new priority through to the codecs PipeWire offers.
+
+    The headphones change what they offer at once, but PipeWire learns what a
+    device offers only when the audio link is set up. Sometimes the headphones
+    take that link down and back up on their own — a WH-1000XM5 moving to a
+    stable connection does, and PipeWire's card is gone for seven seconds —
+    and sometimes they do not, and LDAC stays missing after moving back to
+    sound quality until something reconnects. So give them a moment to start,
+    and reconnect the audio profile ourselves if they have not.
+    """
+    started = time.monotonic()
+    reconnected = False
+    previous = None
+    while True:
+        link.read_audio_codecs()
+        codecs = link.state.get("codecs")
+        # Changed, and the same on two reads running: PipeWire fills the list
+        # in one profile at a time as the link comes back.
+        if codecs and codecs != codecs_before and (codecs == previous or link.answers_immediately):
+            break
+        previous = codecs
+        elapsed = time.monotonic() - started
+        # Without audio to begin with, there is nothing to see through.
+        if link.answers_immediately or not codecs_before or elapsed >= PRIORITY_SETTLE_TIMEOUT:
+            break
+        if not reconnected and codecs == codecs_before and elapsed >= PRIORITY_RENEGOTIATION_GRACE:
+            reconnect_audio(link.address)
+            reconnected = True
+            continue
+        link.pump(0.5)
+    # The headphones call the codec unsettled until the link is back up, and
+    # say nothing once it is; ask until they name one.
+    for _ in range(4):
+        link.request(codec_requests(link.state))
+        if link.state.get("codec") != "unknown" or link.answers_immediately:
+            break
+        link.pump(1.0)
+
+
+def reconnect_audio(address: str) -> None:
+    """Take the audio profile down and up again, leaving the control link be."""
+    bluetoothctl("disconnect", address, AUDIO_SINK_UUID, timeout=10.0)
+    bluetoothctl("connect", address, AUDIO_SINK_UUID, timeout=15.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1245,6 +1934,11 @@ class DemoDevice:
         self.auto_power_off = (0x11, 0x00)
         self.touch_sensor = True
         self.voice_notifications = True
+        self.a2dp_codec = "LDAC"
+
+    def a2dp_codecs(self) -> list[str]:
+        """What PipeWire would offer for this pair."""
+        return ["LDAC", "AAC", "SBC"]
 
     def asc(self) -> bytes:
         return bytes([ASC_RET, 0x02, 0x01 if self.nc_on else 0x00, 0x02, self.mode,
@@ -1329,17 +2023,183 @@ class DemoDevice:
         return []
 
 
+class DemoDeviceV2:
+    """Answers requests the way a WH-1000XM5 on firmware 2.5.1 does.
+
+    The support lists and every reply layout are the ones the real headphones
+    sent, including their quirks: auto-power-off timers are answered with
+    "when taken off", and the touch panel only turns off after the device has
+    asked for — and been given — confirmation.
+    """
+
+    # (function, priority) pairs, exactly as the headphones list them.
+    TABLE1 = bytes.fromhex(
+        "10 ff 12 ff 13 ff 14 ff 23 ff 25 21 20 ff 27 ff d1 19 32 26 50 0a 6b 06 70 01"
+        " 90 ff a1 0b c1 ff c2 ff e1 0d e2 0f f4 14 93 ff 69 1a d2 12 f9 27 b0 28 b2 2b"
+        " b6 2a f1 23 fd 1b fc 09 b8 ff b7 ff 19 ff")
+    TABLE2 = bytes.fromhex("41 25 50 ff f2 ff 32 03 31 ff f8 1e")
+
+    def __init__(self):
+        self.nc_on = True
+        self.ambient = False
+        self.focus_on_voice = False
+        self.level = 15
+        self.battery = 64
+        self.eq_preset = 0x00
+        self.eq = [10] * 6
+        self.dsee = False
+        self.speak_to_chat = False
+        self.stc = [0x00, 0x01]         # sensitivity, timeout
+        self.pause_when_taken_off = True
+        self.auto_power_off = 0x10
+        self.touch_panel = True
+        self.voice_guidance = True
+        self.alerts = False
+        self.priority = PRIORITY["sound-quality"]
+        self.a2dp_codec = "LDAC"
+
+    def a2dp_codecs(self) -> list[str]:
+        # Preferring a stable connection takes LDAC off the table.
+        if self.priority == PRIORITY["connection"]:
+            return ["SBC-XQ", "SBC"]
+        return ["LDAC", "SBC-XQ", "SBC"]
+
+    def respond(self, msg_type: int, payload: bytes) -> list[tuple[int, bytes]]:
+        if not payload:
+            return []
+        code, sub = payload[0], (payload[1] if len(payload) > 1 else 0)
+
+        if msg_type == MSG_COMMAND_2:
+            if code == SUPPORT_GET:
+                return [(MSG_COMMAND_2, bytes([SUPPORT_RET, 0x00, len(self.TABLE2) // 2]) + self.TABLE2)]
+            if code == VOICE_NOTIFICATIONS_SET and sub == V2_VOICE_GUIDANCE:
+                self.voice_guidance = payload[2] == 0x00
+                return [(MSG_COMMAND_2, bytes([VOICE_NOTIFICATIONS_NOTIFY, sub, _off_byte(self.voice_guidance)]))]
+            if code == VOICE_NOTIFICATIONS_GET and sub == V2_VOICE_GUIDANCE:
+                return [(MSG_COMMAND_2, bytes([VOICE_NOTIFICATIONS_RET, sub, _off_byte(self.voice_guidance), 0x01]))]
+            return []
+
+        if code == INIT_REQUEST:
+            return [req(bytes([INIT_REPLY, 0x00, 0x03, 0x00, 0x20, 0x16, 0x00, 0x00]))]
+        if code == SUPPORT_GET:
+            return [req(bytes([SUPPORT_RET, 0x00, len(self.TABLE1) // 2]) + self.TABLE1)]
+        if code == FW_VERSION_REQUEST:
+            return [req(bytes([FW_VERSION_REPLY, 0x02, 5]) + b"2.5.1")]
+        if code == V2_CODEC_GET:
+            wire = {"LDAC": 0x10, "AAC": 0x02}.get(self.a2dp_codec, 0x01)
+            return [req(bytes([V2_CODEC_RET, 0x02, wire]))]
+        if code == V2_BATTERY_GET and sub == V2_BATTERY:
+            return [req(bytes([V2_BATTERY_RET, V2_BATTERY, self.battery, 0x00]))]
+
+        if code in (ASC_GET, ASC_SET) and sub == V2_ASC_DUAL:
+            if code == ASC_SET:
+                self.nc_on = payload[3] == 0x01
+                self.ambient = self.nc_on and payload[4] == 0x01
+                self.focus_on_voice = payload[5] == 0x01
+                self.level = payload[6]
+            reply = ASC_RET if code == ASC_GET else ASC_NOTIFY
+            return [req(bytes([reply, sub, 0x01, 0x01 if self.nc_on else 0x00, 0x01 if self.ambient else 0x00,
+                               0x01 if self.focus_on_voice else 0x00, self.level]))]
+
+        if code in (EQUALIZER_GET, EQUALIZER_SET) and sub == 0x00:
+            if code == EQUALIZER_SET:
+                self.eq_preset = payload[2]
+                if payload[3] == 0x06:
+                    self.eq = list(payload[4:10])
+                elif self.eq_preset == EQ_PRESETS["bass-boost"]:
+                    self.eq = [17] + [10] * 5
+                else:
+                    self.eq = [10] * 6
+            reply = EQUALIZER_RET if code == EQUALIZER_GET else EQUALIZER_NOTIFY
+            return [req(bytes([reply, sub, self.eq_preset, 0x06] + self.eq))]
+
+        if code in (AUDIO_GET, AUDIO_SET) and sub == V2_CONNECTION_MODE:
+            if code == AUDIO_SET:
+                self.priority = payload[2]
+                if self.a2dp_codec not in self.a2dp_codecs():
+                    self.a2dp_codec = self.a2dp_codecs()[0]
+            reply = AUDIO_RET if code == AUDIO_GET else AUDIO_NOTIFY
+            return [req(bytes([reply, sub, self.priority]))]
+
+        if code in (AUDIO_GET, AUDIO_SET) and sub == V2_UPSCALING:
+            if code == AUDIO_SET:
+                self.dsee = payload[2] == 0x01
+            reply = AUDIO_RET if code == AUDIO_GET else AUDIO_NOTIFY
+            return [req(bytes([reply, sub, 0x01 if self.dsee else 0x00]))]
+
+        if code in (SYSTEM_GET, SYSTEM_SET):
+            reply = SYSTEM_RET if code == SYSTEM_GET else SYSTEM_NOTIFY
+            if sub == V2_SYSTEM_SPEAK_TO_CHAT:
+                if code == SYSTEM_SET:
+                    self.speak_to_chat = payload[2] == 0x00
+                return [req(bytes([reply, sub, _off_byte(self.speak_to_chat), 0x01]))]
+            if sub == V2_SYSTEM_PAUSE_WHEN_TAKEN_OFF:
+                if code == SYSTEM_SET:
+                    self.pause_when_taken_off = payload[2] == 0x00
+                return [req(bytes([reply, sub, _off_byte(self.pause_when_taken_off)]))]
+            return []
+
+        if code in (SYSTEM_EXT_GET, SYSTEM_EXT_SET) and sub == V2_SYSTEM_SPEAK_TO_CHAT:
+            if code == SYSTEM_EXT_SET:
+                self.stc = [payload[2], payload[3]]
+            reply = SYSTEM_EXT_RET if code == SYSTEM_EXT_GET else SYSTEM_EXT_NOTIFY
+            return [req(bytes([reply, sub] + self.stc))]
+
+        if code in (V2_POWER_PARAM_GET, V2_POWER_PARAM_SET) and sub == V2_AUTO_POWER_OFF:
+            if code == V2_POWER_PARAM_SET and payload[2] in (0x10, 0x11):
+                self.auto_power_off = payload[2]
+            reply = V2_POWER_PARAM_RET if code == V2_POWER_PARAM_GET else V2_POWER_PARAM_NOTIFY
+            return [req(bytes([reply, sub, self.auto_power_off, 0x00]))]
+
+        if code == SETTING_CAPABILITY_GET and sub == 0xD1:
+            return [req(bytes([SETTING_CAPABILITY_RET, sub, 0x00, 0x01, len(TOUCH_PANEL_SETTING)])
+                        + TOUCH_PANEL_SETTING + b"\x00")]
+        if code == SETTING_CAPABILITY_GET and sub == 0xD2:
+            name = b"MULTIPOINT_SETTING"
+            return [req(bytes([SETTING_CAPABILITY_RET, sub, 0x00, 0x01, len(name)]) + name)]
+        if code == SETTING_GET and sub in (0xD1, 0xD2):
+            return [req(bytes([SETTING_RET, sub, 0x00, _off_byte(self.touch_panel if sub == 0xD1 else True)]))]
+        if code == SETTING_SET and sub == 0xD1:
+            if payload[3] == 0x00:
+                self.touch_panel = True
+            elif self.alerts:
+                return [req(bytes([ALERT_NOTIFY, ALERT_FIXED_MESSAGE, ALERT_TOUCH_PANEL_OFF_RECONNECT, 0x01]))]
+            return [req(bytes([SETTING_NOTIFY, sub, 0x00, _off_byte(self.touch_panel)]))]
+
+        if code == ALERT_SET_STATUS and sub == ALERT_FIXED_MESSAGE:
+            self.alerts = payload[2] == 0x00
+            return []
+        if code == ALERT_SET_PARAM and sub == ALERT_FIXED_MESSAGE and payload[2] == ALERT_TOUCH_PANEL_OFF_RECONNECT:
+            if payload[3] == 0x01:
+                self.touch_panel = False
+            return [req(bytes([SETTING_NOTIFY, 0xD1, 0x00, _off_byte(self.touch_panel)]))]
+
+        return []
+
+
+DEMO_MODELS = {
+    "WH-1000XM4": DemoDevice,
+    "WH-1000XM5": DemoDeviceV2,
+}
+
+
 class DemoLink(Link):
     """A Link whose other end is a DemoDevice instead of a radio."""
 
     answers_immediately = True
 
-    def __init__(self, on_change=None):
+    def __init__(self, on_change=None, model: str = "WH-1000XM4"):
         super().__init__("00:00:00:00:00:00", on_change=on_change)
-        self.device = DemoDevice()
-        self.state["name"] = "WH-1000XM4 (demo)"
-        self.state["features"] = features_for("WH-1000XM4")
+        self.device = DEMO_MODELS[model]()
+        self.state["name"] = f"{model} (demo)"
+        self.state["features"] = features_for(model)
         self.state["connected"] = True
+        # Settle the protocol the way a real handshake would.
+        for _, reply in self.device.respond(MSG_COMMAND_1, bytes([INIT_REQUEST, 0x00])):
+            if len(reply) == 8:
+                self.use_v2()
+            else:
+                self.state["protocol"] = 1
 
     def connect(self, timeout: float = 0.0) -> int:
         return 0
@@ -1355,9 +2215,22 @@ class DemoLink(Link):
         for reply_type, reply in self.device.respond(msg_type, sent):
             _, _, received = decode_message(encode_message(reply_type, self.seq, reply))
             self.dispatch(reply_type, received)
+        # The replies are already in, so anything they called for goes now.
+        self._flush()
 
     def pump(self, timeout: float) -> None:
         return
+
+    def read_audio_codecs(self) -> None:
+        self.state["codecs"] = self.device.a2dp_codecs()
+        self.state["a2dp_codec"] = self.device.a2dp_codec
+
+    def select_codec(self, codec: str) -> None:
+        if codec not in self.device.a2dp_codecs():
+            raise ValueError(f"{codec} is not on offer for these headphones right now")
+        self.device.a2dp_codec = codec
+        self.read_audio_codecs()
+        self.request(codec_requests(self.state))
 
 
 # ---------------------------------------------------------------------------
@@ -1503,7 +2376,7 @@ class Daemon:
     def try_connect(self) -> None:
         self.next_attempt = time.monotonic() + self.retry_delay
         if demo_mode():
-            self.link = DemoLink(on_change=self.publish)
+            self.link = DemoLink(on_change=self.publish, model=demo_model())
             self.link.refresh()
             self.publish()
             return
@@ -1512,9 +2385,7 @@ class Daemon:
             self.publish()
             return
 
-        link = Link(device["address"], on_change=self.publish)
-        link.state["name"] = device["name"]
-        link.state["features"] = features_for(device["name"])
+        link = Link.for_device(device, on_change=self.publish)
         try:
             link.connect()
             link.refresh()
@@ -1559,6 +2430,11 @@ class Daemon:
                 raise NotConnected("headphones not connected")
             try:
                 return action(self.link)
+            except Reconnecting as exc:
+                # Done, not failed: the headphones went away to apply it and
+                # the main loop brings them back like any other lost link.
+                self.lose_link(str(exc))
+                return None
             except (NotConnected, OSError) as exc:
                 self.lose_link(str(exc))
                 if attempt == 2:
@@ -1574,7 +2450,7 @@ class Daemon:
             "set": lambda link: apply_setting(link, str(request.get("key", "")), request.get("value")),
             "cycle": lambda link: apply_setting(link, "nc", "cycle"),
             "refresh": lambda link: link.refresh(),
-            "power-off": lambda link: link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00])),
+            "power-off": lambda link: link.write(*power_off_request(link.state)),
         }
         action = actions.get(command)
         if action is None:
@@ -1746,7 +2622,10 @@ class Daemon:
                     self.next_poll = time.monotonic() + self.POLL_INTERVAL
                     heard = self.link.last_rx
                     try:
-                        self.link.request([req(bytes([BATTERY_GET, BATTERY_SINGLE]))], settle=1.0)
+                        self.link.request(battery_requests(self.link.state), settle=1.0)
+                        # Someone else may have switched the codec meanwhile.
+                        self.link.read_audio_codecs()
+                        self.publish()
                     except (NotConnected, OSError) as exc:
                         self.lose_link(str(exc))
                     else:
@@ -1821,10 +2700,16 @@ def demo_mode() -> bool:
     return os.environ.get("SONY_HEADPHONES_DEMO", "") not in ("", "0")
 
 
+def demo_model() -> str:
+    """SONY_HEADPHONES_DEMO=xm5 stands in a WH-1000XM5; anything else, an XM4."""
+    wanted = os.environ.get("SONY_HEADPHONES_DEMO", "").lower()
+    return "WH-1000XM5" if wanted in ("xm5", "wh-1000xm5", "v2") else "WH-1000XM4"
+
+
 def direct(request: dict, preferred: str | None) -> dict:
     """Do it ourselves, for when no daemon is running."""
     if demo_mode():
-        link = DemoLink()
+        link = DemoLink(model=demo_model())
         link.refresh()
         command = str(request.get("cmd", "status"))
         if command == "set":
@@ -1840,9 +2725,7 @@ def direct(request: dict, preferred: str | None) -> dict:
         state["error"] = "no connected Sony headphones found"
         return {"ok": False, "error": state["error"], "state": state}
 
-    link = Link(device["address"])
-    link.state["name"] = device["name"]
-    link.state["features"] = features_for(device["name"])
+    link = Link.for_device(device)
     try:
         link.connect()
         link.refresh()
@@ -1852,8 +2735,12 @@ def direct(request: dict, preferred: str | None) -> dict:
         elif command == "cycle":
             apply_setting(link, "nc", "cycle")
         elif command == "power-off":
-            link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00]))
+            link.write(*power_off_request(link.state))
         return {"ok": True, "state": link.state}
+    except Reconnecting as exc:
+        state = link.state
+        state["error"] = str(exc)
+        return {"ok": True, "state": state}
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "state": link.state}
     except (NotConnected, OSError) as exc:
@@ -1864,8 +2751,14 @@ def direct(request: dict, preferred: str | None) -> dict:
         link.close()
 
 
+# Long enough for the slowest change, a new priority, to finish. Giving up
+# sooner is worse than waiting: the fallback below would dial the headphones
+# while the daemon still holds them.
+DAEMON_REQUEST_TIMEOUT = 30.0
+
+
 def run_request(request: dict, preferred: str | None) -> dict:
-    response = ask_daemon(request)
+    response = ask_daemon(request, timeout=DAEMON_REQUEST_TIMEOUT)
     if response is None:
         response = direct(request, preferred)
     return response
@@ -1891,6 +2784,9 @@ def describe(state: dict) -> str:
         add("Battery", f"{battery}%" + (" (charging)" if state.get("charging") else ""))
     add("Firmware", state.get("firmware"))
     add("Codec", state.get("codec"))
+    if state.get("codecs"):
+        add("Codecs on offer", ", ".join(state["codecs"]))
+    add("Priority", state.get("priority"))
     add("Mode", state.get("nc_mode"))
     if state.get("nc_mode") in ("ambient-sound", "off"):
         add("Ambient level", f"{state.get('ambient_level')}/{MAX_AMBIENT_LEVEL}")
@@ -1998,9 +2894,7 @@ def cmd_probe(args) -> int:
         print(f"  cached channel:  {cached_channel(device['address']) or '-'}")
 
     device = find_device(args.address) or devices[0]
-    link = Link(device["address"])
-    link.state["name"] = device["name"]
-    link.state["features"] = features_for(device["name"])
+    link = Link.for_device(device)
     started = time.monotonic()
     try:
         channel = link.connect()
@@ -2008,8 +2902,15 @@ def cmd_probe(args) -> int:
         print(f"  connect:         FAILED ({exc})")
         return 1
     print(f"  connect:         ok on RFCOMM channel {channel} in {time.monotonic() - started:.2f}s")
+    print(f"  protocol:        v{link.state['protocol']}")
     try:
         link.refresh()
+        functions = link.state.get("functions")
+        if functions:
+            # The device's own list of what it supports: what a bug report for
+            # a model nobody here has tested needs most.
+            for table in ("table1", "table2"):
+                print(f"  {table + ':':<17}{' '.join(f'{code:02x}' for code in functions.get(table) or [])}")
         print()
         print(describe(link.state))
     finally:
@@ -2020,7 +2921,7 @@ def cmd_probe(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sony-headphones",
-        description="Control Sony headphones (protocol v1: WH-1000XM2/XM3/XM4) over Bluetooth.",
+        description="Control Sony headphones (WH-1000XM2 through XM5) over Bluetooth.",
     )
     parser.add_argument("--address", help="Bluetooth MAC to use, if several are connected")
     parser.add_argument("--json", action="store_true", help="print the device state as JSON")

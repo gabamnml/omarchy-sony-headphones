@@ -38,6 +38,10 @@ Panel {
   // than one that is not offered.
   readonly property var features: sony.state.features || []
   function supports(feature) { return Model.supports(features, feature) }
+  // From PipeWire, not the headphones, so any model can have it.
+  readonly property bool hasCodecs: !!sony.state.codecs && sony.state.codecs.length > 0
+  readonly property bool hasSoundRows: supports("equalizer") || supports("dsee") || hasCodecs
+                                       || supports("connection-priority")
 
   property int cursorIndex: -1
   property bool cursorActive: false
@@ -66,12 +70,14 @@ Panel {
     }
     if (supports("equalizer")) list.push("eq")
     if (supports("dsee")) list.push("dsee")
+    if (hasCodecs) list.push("codec")
+    if (supports("connection-priority")) list.push("priority")
     if (supports("speak-to-chat")) {
       list.push("stc")
       if (sony.state.speak_to_chat) {
         list.push("stc-sensitivity")
         list.push("stc-timeout")
-        list.push("stc-focus")
+        if (supports("speak-to-chat-voice-focus")) list.push("stc-focus")
       }
     }
     if (supports("pause-when-taken-off")) list.push("pause")
@@ -130,6 +136,10 @@ Panel {
       sony.setAmbientLevel(sony.ambientLevel + direction)
     } else if (key === "eq") {
       sony.choose("eq", "eq_preset", stepOption(Model.EQ_PRESETS, sony.state.eq_preset, direction))
+    } else if (key === "codec") {
+      sony.choose("codec", "a2dp_codec", stepOption(Model.codecOptions(sony.state.codecs), sony.state.a2dp_codec, direction))
+    } else if (key === "priority") {
+      sony.choose("priority", "priority", stepOption(Model.PRIORITY, sony.state.priority, direction))
     } else if (key === "stc-sensitivity") {
       sony.choose("stc-sensitivity", "stc_sensitivity", stepOption(Model.STC_SENSITIVITY, sony.state.stc_sensitivity, direction))
     } else if (key === "stc-timeout") {
@@ -384,14 +394,14 @@ Panel {
           }
 
           PanelSeparator {
-            visible: sony.connected && (root.supports("equalizer") || root.supports("dsee"))
+            visible: sony.connected && root.hasSoundRows
             foreground: root.foreground
           }
 
           // -- sound ----------------------------------------------------
 
           Column {
-            visible: sony.connected && (root.supports("equalizer") || root.supports("dsee"))
+            visible: sony.connected && root.hasSoundRows
             width: parent.width
             spacing: Style.space(8)
 
@@ -416,6 +426,24 @@ Panel {
               label: "DSEE Extreme"
               hint: "Upscale compressed audio"
               checked: !!sony.state.dsee
+            }
+
+            DropdownRow {
+              rowKey: "codec"
+              visible: root.hasCodecs
+              label: "Codec"
+              options: Model.codecOptions(sony.state.codecs)
+              value: String(sony.state.a2dp_codec || "")
+              onPicked: function(value) { sony.choose("codec", "a2dp_codec", value) }
+            }
+
+            DropdownRow {
+              rowKey: "priority"
+              visible: root.supports("connection-priority")
+              label: "Priority"
+              options: Model.PRIORITY
+              value: String(sony.state.priority || "sound-quality")
+              onPicked: function(value) { sony.choose("priority", "priority", value) }
             }
           }
 
@@ -464,7 +492,7 @@ Panel {
 
             ToggleRow {
               rowKey: "stc-focus"
-              visible: !!sony.state.speak_to_chat
+              visible: !!sony.state.speak_to_chat && root.supports("speak-to-chat-voice-focus")
               label: "Voice focus while chatting"
               checked: !!sony.state.stc_focus_on_voice
             }
@@ -501,6 +529,7 @@ Panel {
               rowKey: "touch"
               visible: root.supports("touch-sensor")
               label: "Touch controls"
+              hint: sony.state.protocol === 2 ? "Switching off briefly reconnects" : ""
               checked: !!sony.state.touch_sensor
             }
 
@@ -526,12 +555,16 @@ Panel {
             visible: sony.connected
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: [sony.state.codec, sony.state.firmware ? "firmware " + sony.state.firmware : ""]
-              .filter(function(part) { return !!part }).join(" · ")
-            color: root.dim
+            // A change that did not take says why here, in place of the usual
+            // codec and firmware line, until the next change is made.
+            text: sony.setError !== "" ? sony.setError
+              : [sony.state.codec, sony.state.firmware ? "firmware " + sony.state.firmware : ""]
+                  .filter(function(part) { return !!part }).join(" · ")
+            color: sony.setError !== "" ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            wrapMode: sony.setError !== "" ? Text.WordWrap : Text.NoWrap
+            elide: sony.setError !== "" ? Text.ElideNone : Text.ElideRight
           }
         }
       }

@@ -14,6 +14,9 @@ Item {
 
   property var state: ({ connected: false })
   property string lastError: ""
+  // Why the last change did not take, until the next one. Kept apart from
+  // lastError, which the refresh after every change resets from the state.
+  property string setError: ""
   property bool starting: true
 
   readonly property bool connected: !!state.connected
@@ -61,6 +64,7 @@ Item {
   function set(key, value, patch) {
     if (!connected || helperPath === "") return
     if (patch) optimistic(patch)
+    setError = ""
     setProcess.command = argv(["set", key, String(value)])
     setProcess.running = true
   }
@@ -143,7 +147,7 @@ Item {
     command: []
     stderr: SplitParser { onRead: function(line) {
       var text = String(line || "").trim()
-      if (text !== "") root.lastError = text
+      if (text !== "") root.setError = text
     } }
     onExited: function(exitCode) {
       if (exitCode === 0) root.lastError = ""
