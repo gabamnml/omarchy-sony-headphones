@@ -67,6 +67,7 @@ the XM4:
 | WH-1000XM4 | Verified on hardware, firmware 3.0.1 — every setting below round-tripped |
 | WH-1000XM3, WH-1000XM2 | Same protocol, untested — reports welcome |
 | WF-1000XM4/XM5, WH-1000XM5/XM6, LinkBuds, CH720N | **Not supported.** These speak the v2 protocol; the plugin detects them and says so instead of sending bytes they will ignore |
+| WH-1000XM4C | **Not supported.** Despite the name a new-generation model (2026): it advertises no v1 control service at all, so there is nothing to connect to. `probe` lists it as connected-but-unsupported instead of the headphones merely looking absent |
 
 Each model honours a different subset, so the panel only draws the rows that
 model actually accepts — a control that silently does nothing is worse than one

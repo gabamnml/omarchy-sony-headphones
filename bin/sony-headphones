@@ -742,6 +742,34 @@ def connected_devices() -> list[dict]:
     return devices
 
 
+SONY_NAME_RE = re.compile(r"WH-1000X|WF-1000X|LinkBuds", re.IGNORECASE)
+
+
+def unrecognized_sony_devices() -> list[dict]:
+    """Connected devices that look like Sony headphones but offer no v1 service.
+
+    A 1000X-class model that advertises none of the v1 control service is not
+    a pairing problem: the newer generations (WH-1000XM5/XM6, the 2026
+    WH-1000XM4C, the LinkBuds line) moved the service with the protocol, and
+    this plugin cannot follow. Naming them turns a bare "none connected" —
+    which reads as if the Bluetooth link were down — into something a user
+    can act on.
+    """
+    recognized = {device["address"] for device in connected_devices()}
+    devices = []
+    for line in bluetoothctl("devices", "Connected").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or parts[0] != "Device" or not MAC_RE.match(parts[1]):
+            continue
+        address = parts[1]
+        if address in recognized:
+            continue
+        name = parts[2].strip() if len(parts) > 2 else address
+        if SONY_NAME_RE.search(name):
+            devices.append({"address": address, "name": name})
+    return devices
+
+
 def find_device(preferred: str | None = None) -> dict | None:
     devices = connected_devices()
     if preferred:
@@ -1991,7 +2019,17 @@ def cmd_probe(args) -> int:
     devices = connected_devices()
     if not devices:
         print("Sony devices:      none connected")
-        print("\nPair and connect the headphones first, then run this again.")
+        unsupported = unrecognized_sony_devices()
+        for device in unsupported:
+            print(f"Connected, unsupported: {device['name']} [{device['address']}]")
+        if unsupported:
+            print(
+                "\nNo v1 control service (96cc203e-…) is advertised on these, so\n"
+                "there is nothing here to talk to: they are newer-generation\n"
+                "models (XM5/XM6, the 2026 XM4C) speaking Sony's newer protocol."
+            )
+        else:
+            print("\nPair and connect the headphones first, then run this again.")
         return 1
     for device in devices:
         print(f"Sony device:       {device['name']} [{device['address']}]")
